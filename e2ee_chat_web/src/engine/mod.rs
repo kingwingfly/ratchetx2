@@ -1639,6 +1639,9 @@ impl Engine<Vault> {
                         "choose the file again to go on"
                     } else {
                         self.hold(&peer, pending.history_index);
+                        if same_server(&inner.server, &origin()) {
+                            self.uploads.set_waiting_uploads_wait_sign_in(true);
+                        }
                         "choose the file again, then sign in to the server"
                     };
                     self.show_upload(&peer, &pending, UploadState::Paused(reason.to_string()));
@@ -2024,6 +2027,9 @@ impl<V: VaultStore> Engine<V> {
                         "choose the file again to go on"
                     } else {
                         self.hold(&peer, pending.history_index);
+                        if same_server(&inner.server, &origin()) {
+                            self.uploads.set_waiting_uploads_wait_sign_in(true);
+                        }
                         "choose the file again, then sign in to the server"
                     };
                     self.show_upload(&peer, &pending, UploadState::Paused(reason.to_string()));

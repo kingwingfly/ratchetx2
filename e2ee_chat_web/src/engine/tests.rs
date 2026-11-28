@@ -36069,3 +36069,474 @@ fn r28_round28_web_engine_regressions() {
         );
     });
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r29_round29_web_engine_regressions() {
+    use super::WAITS_SIGN_IN;
+    use crate::state::UploadState;
+    use leptos::prelude::{Set, WithUntracked};
+    use prost::Message as _;
+    use std::sync::Arc;
+
+    let _guard = crate::transport::mock_fetch(|_s, _p, _b| Ok((200, vec![])));
+    let mut pool = futures::executor::LocalPool::new();
+    let signed_in_json = br#"{"subject":"member","expires":9999999999999}"#;
+
+    // Part 1 (R29-P1-1):
+    // When all outbound channels (waiting upload, peer waits, publish wait, farewells wait) are
+    // latched on sign-in, `sync()` probes `GET /auth`. While signed out (`{}`), nothing fires;
+    // once cross-tab sign-in succeeds (`{"subject":...}`), the VERY SAME `sync()` pass clears all
+    // latched waits, resets `declined_sign_in`, releases non-waiting `ui.held`, and starts the
+    // waiting upload (`StartUpload`).
+    pool.run_until(async {
+        let (eng, peer_a, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let cgen_a = {
+            let guard = eng.inner.lock().await;
+            guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer_a)
+                .unwrap()
+                .state
+                .conversation_gen
+        };
+        let peer_b = [0x61u8; 32];
+        let src = super::attachments::ChunkSource::Bytes {
+            name: "cross_tab_sync.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x11u8; 32]),
+        };
+        eng.wait_for_sign_in(peer_a, cgen_a, src).await.unwrap();
+        eng.queue.mark_waits_sign_in(peer_b);
+        eng.startup.set_publish_waits_sign_in(true);
+        eng.startup.set_farewells_wait_sign_in(true);
+        eng.decline_sign_in_prompts();
+        eng.hold(&peer_b, 99);
+
+        // Signed out: `GET /auth` returns `{}` -> waits remain latched, `StartUpload` does not run.
+        let auth_hits = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let start_hits = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        {
+            let ah = auth_hits.clone();
+            let sh = start_hits.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path == "/auth" {
+                    ah.set(ah.get() + 1);
+                    return Ok((200, b"{}".to_vec()));
+                }
+                if path.ends_with("/StartUpload") {
+                    sh.set(sh.get() + 1);
+                    return Ok((
+                        429,
+                        br#"{"code":"resource_exhausted","message":"unexpected"}"#.to_vec(),
+                    ));
+                }
+                if path.ends_with("/GetServerInfo") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::GetServerInfoResponse {
+                            server_id: "localhost".into(),
+                            pq_enabled: true,
+                            supported_suites: vec![1, 2],
+                            pq_ratchet_supported: true,
+                        }
+                        .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/ListInitialMessages") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::ListInitialMessagesResponse::default()
+                            .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/FetchSigned") {
+                    return Ok((
+                        200,
+                        protocol::mailbox_v2::FetchSignedResponse::default().encode_to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            eng.sync().await;
+        }
+        assert_eq!(auth_hits.get(), 1);
+        assert_eq!(start_hits.get(), 0);
+        assert!(
+            eng.queue.waits_for_sign_in(&peer_b)
+                && eng.startup.publish_waits_sign_in()
+                && eng.startup.farewells_wait_sign_in()
+                && eng.uploads.waiting_uploads_wait_sign_in(),
+            "R29-P1-1: signed-out GET /auth must keep all latched waits intact"
+        );
+
+        // Cross-tab sign-in: `GET /auth` now returns valid `SignIn` -> same `sync()` unlatches
+        // all channels, releases non-waiting `ui.held`, resets `declined_sign_in`, and runs
+        // `StartUpload`!
+        let auth_hits2 = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let start_hits2 = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        {
+            let ah = auth_hits2.clone();
+            let sh = start_hits2.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path == "/auth" {
+                    ah.set(ah.get() + 1);
+                    return Ok((200, signed_in_json.to_vec()));
+                }
+                if path.ends_with("/StartUpload") {
+                    sh.set(sh.get() + 1);
+                    return Ok((
+                        429,
+                        br#"{"code":"resource_exhausted","message":"quota full"}"#.to_vec(),
+                    ));
+                }
+                if path.ends_with("/GetServerInfo") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::GetServerInfoResponse {
+                            server_id: "localhost".into(),
+                            pq_enabled: true,
+                            supported_suites: vec![1, 2],
+                            pq_ratchet_supported: true,
+                        }
+                        .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/ListInitialMessages") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::ListInitialMessagesResponse::default()
+                            .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/FetchSigned") {
+                    return Ok((
+                        200,
+                        protocol::mailbox_v2::FetchSignedResponse::default().encode_to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            eng.sync().await;
+        }
+        assert_eq!(auth_hits2.get(), 1);
+        assert_eq!(
+            start_hits2.get(),
+            1,
+            "R29-P1-1: cross-tab sign-in observed via GET /auth must start waiting uploads in the same sync()"
+        );
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer_b)
+                && !eng.startup.publish_waits_sign_in()
+                && !eng.startup.farewells_wait_sign_in()
+                && !eng.uploads.waiting_uploads_wait_sign_in()
+                && !eng.ui.held.with_untracked(|h| h.contains(&(peer_b, 99))),
+            "R29-P1-1: cross-tab sign-in via GET /auth must clear every latched wait and non-waiting ui.held"
+        );
+        eng.ui.dialog.set(None);
+        eng.ask_sign_in_background();
+        assert_eq!(
+            eng.ui.dialog.get_untracked(),
+            Some(Dialog::SignIn),
+            "R29-P1-1: GET /auth cross-tab sign-in must reset declined_sign_in"
+        );
+    });
+
+    // Part 2 (R29-P2-1):
+    // `start_waiting_with_mode` updates the paused upload card away from stale `WAITS_SIGN_IN`
+    // on both transient 5xx and server refusals, re-arming `start_waiting_needed` ONLY on
+    // transient non-refusal failures (so `sync()` retries automatically without looping on 429).
+    pool.run_until(async {
+        let (eng, peer_a, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let cgen_a = {
+            let guard = eng.inner.lock().await;
+            guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer_a)
+                .unwrap()
+                .state
+                .conversation_gen
+        };
+        let src = super::attachments::ChunkSource::Bytes {
+            name: "transient_500.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x22u8; 32]),
+        };
+        eng.wait_for_sign_in(peer_a, cgen_a, src).await.unwrap();
+
+        // 2a: Transient 500 -> card no longer shows `WAITS_SIGN_IN`, AND `start_waiting_needed`
+        // IS re-armed so a subsequent `sync()` retries automatically!
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/StartUpload") {
+                    return Ok((500, br#"{"code":"internal","message":"server blip"}"#.to_vec()));
+                }
+                Ok((200, vec![]))
+            });
+            assert!(!eng.start_waiting_uploads().await);
+        }
+        assert!(
+            eng.uploads.start_waiting_needed(),
+            "R29-P2-1: transient 500 on StartUpload must re-arm start_waiting_needed for sync retry"
+        );
+        let card_after_500 = eng
+            .ui
+            .uploads
+            .with_untracked(|u| u.first().map(|item| item.state.clone()));
+        assert!(
+            matches!(card_after_500, Some(UploadState::Paused(ref msg)) if msg != WAITS_SIGN_IN),
+            "R29-P2-1: upload card must replace stale WAITS_SIGN_IN message on transient 500: got {card_after_500:?}"
+        );
+
+        // 2b: Next `sync()` retries `StartUpload`; server returns `429 LimitExceeded` (definitive
+        // refusal) -> card updates to quota error AND `start_waiting_needed` stays `false`!
+        let retry_hits = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        {
+            let rh = retry_hits.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/StartUpload") {
+                    rh.set(rh.get() + 1);
+                    return Ok((
+                        429,
+                        br#"{"code":"resource_exhausted","message":"quota exceeded"}"#.to_vec(),
+                    ));
+                }
+                if path.ends_with("/GetServerInfo") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::GetServerInfoResponse {
+                            server_id: "localhost".into(),
+                            pq_enabled: true,
+                            supported_suites: vec![1, 2],
+                            pq_ratchet_supported: true,
+                        }
+                        .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/ListInitialMessages") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::ListInitialMessagesResponse::default()
+                            .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/FetchSigned") {
+                    return Ok((
+                        200,
+                        protocol::mailbox_v2::FetchSignedResponse::default().encode_to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            eng.sync().await;
+        }
+        assert_eq!(retry_hits.get(), 1);
+        assert!(
+            !eng.uploads.start_waiting_needed(),
+            "R29-P2-1: definitive 429 LimitExceeded must NOT re-arm start_waiting_needed"
+        );
+        let card_after_429 = eng
+            .ui
+            .uploads
+            .with_untracked(|u| u.first().map(|item| item.state.clone()));
+        assert!(
+            matches!(card_after_429, Some(UploadState::Paused(ref msg)) if msg != WAITS_SIGN_IN),
+            "R29-P2-1: upload card must replace stale WAITS_SIGN_IN message on 429 refusal: got {card_after_429:?}"
+        );
+    });
+
+    // Part 3 (R29-P3-1):
+    // Post-reload `UPLOAD_STATE_WAITING` restored by `restore_uploads_from_vault()` latches
+    // `waiting_uploads_wait_sign_in`, so existing or cross-tab sign-in transitions its card from
+    // `"choose the file again, then sign in to the server"` to `"choose the file again to upload"`.
+    pool.run_until(async {
+        let (eng, peer_a, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let cgen_a = {
+            let guard = eng.inner.lock().await;
+            guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer_a)
+                .unwrap()
+                .state
+                .conversation_gen
+        };
+        let src = super::attachments::ChunkSource::Bytes {
+            name: "reloaded_wait.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x33u8; 32]),
+        };
+        eng.wait_for_sign_in(peer_a, cgen_a, src).await.unwrap();
+        // Simulate page reload: drop in-memory file handles, clear UI uploads and wait flags.
+        eng.uploads.clear_on_teardown();
+        eng.ui.uploads.set(Vec::new());
+        eng.uploads.set_restore_needed(true);
+        eng.restore_uploads_from_vault().await.unwrap();
+        assert!(
+            eng.uploads.waiting_uploads_wait_sign_in(),
+            "R29-P3-1: restore_uploads_from_vault must set waiting_uploads_wait_sign_in for same-origin WAITING uploads"
+        );
+        let card_before = eng
+            .ui
+            .uploads
+            .with_untracked(|u| u.first().map(|item| item.state.clone()));
+        assert_eq!(
+            card_before,
+            Some(UploadState::Paused(
+                "choose the file again, then sign in to the server".into()
+            ))
+        );
+
+        // `sync()` discovers valid sign-in via `GET /auth` -> updates card to `"choose the file again to upload"`!
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path == "/auth" {
+                    return Ok((200, signed_in_json.to_vec()));
+                }
+                if path.ends_with("/GetServerInfo") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::GetServerInfoResponse {
+                            server_id: "localhost".into(),
+                            pq_enabled: true,
+                            supported_suites: vec![1, 2],
+                            pq_ratchet_supported: true,
+                        }
+                        .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/ListInitialMessages") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::ListInitialMessagesResponse::default()
+                            .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/FetchSigned") {
+                    return Ok((
+                        200,
+                        protocol::mailbox_v2::FetchSignedResponse::default().encode_to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            eng.sync().await;
+        }
+        let card_after = eng
+            .ui
+            .uploads
+            .with_untracked(|u| u.first().map(|item| item.state.clone()));
+        assert_eq!(
+            card_after,
+            Some(UploadState::Paused("choose the file again to upload".into())),
+            "R29-P3-1: proven sign-in must update post-reload WAITING upload card to 'choose the file again to upload'"
+        );
+    });
+
+    // Part 4 (R29-P3-2):
+    // Authenticated RPCs whose target contact/submission/upload is deleted or cancelled mid-RTT
+    // STILL invoke `on_origin_auth_proven*` and unblock unrelated latched origin waits & `ui.held`.
+    pool.run_until(async {
+        // 4a: `flush_with_mode` `PushV2` succeeds while `peer_a` is deleted mid-RPC.
+        let (eng, peer_a, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let peer_b = [0x72u8; 32];
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner
+                .add(&peer_a, Kind::Text("delete-mid-push".into()), false)
+                .await
+                .unwrap();
+        }
+        eng.queue.mark_waits_sign_in(peer_b);
+        eng.startup.set_publish_waits_sign_in(true);
+        eng.startup.set_farewells_wait_sign_in(true);
+        eng.hold(&peer_b, 77);
+        {
+            let eng_c = eng.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let eng_c = eng_c.clone();
+                async move {
+                    if path.ends_with("/PushV2") {
+                        let mut guard = eng_c.inner.lock().await;
+                        let inner = guard.as_mut().unwrap();
+                        inner.contacts.retain(|c| c.peer != peer_a);
+                        drop(guard);
+                        return Ok((
+                            200,
+                            protocol::mailbox_v2::PushV2Response::default().encode_to_vec(),
+                        ));
+                    }
+                    Ok((200, vec![]))
+                }
+            });
+            eng.flush(&peer_a).await.unwrap();
+        }
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer_b)
+                && !eng.startup.publish_waits_sign_in()
+                && !eng.startup.farewells_wait_sign_in()
+                && !eng.ui.held.with_untracked(|h| h.contains(&(peer_b, 77))),
+            "R29-P3-2: PushV2 Ok with concurrently deleted peer must still clear unrelated origin waits & ui.held"
+        );
+
+        // 4b: `start_chat` `ClaimBundle` succeeds while `submission_id` is cancelled mid-RPC.
+        let mut bob_client = session::Client::new(Fetch::client(LOCAL_SERVER));
+        let bob_peer = bob_client.identity_key();
+        let bob_key = crate::util::key_to_text(&bob_peer);
+        let bob_bundle = publish_bundle_for_test(&mut bob_client, "localhost", 1).remove(0);
+        let sub_id = eng
+            .startup
+            .begin_new_chat_submit(crate::state::PendingNewChat {
+                key: bob_key.clone(),
+                name: "CancelMidClaim".into(),
+                server: None,
+                pq_pinned: false,
+                allow_classical: false,
+                auto_start: false,
+            });
+        eng.queue.mark_waits_sign_in(peer_b);
+        eng.startup.set_publish_waits_sign_in(true);
+        eng.hold(&peer_b, 78);
+        {
+            let eng_c = eng.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let eng_c = eng_c.clone();
+                let bytes = bob_bundle.encode_to_vec();
+                async move {
+                    if path.ends_with("/ClaimBundle") {
+                        eng_c.startup.cancel_active_submissions();
+                        return Ok((200, bytes));
+                    }
+                    Ok((200, vec![]))
+                }
+            });
+            assert_eq!(
+                eng.start_chat(sub_id, &bob_key, "CancelMidClaim".into(), None, false, false)
+                    .await,
+                Err(StartChatError::Cancelled)
+            );
+        }
+        eng.startup.finish_submission(sub_id);
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer_b)
+                && !eng.startup.publish_waits_sign_in()
+                && !eng.ui.held.with_untracked(|h| h.contains(&(peer_b, 78))),
+            "R29-P3-2: start_chat ClaimBundle Ok with mid-flight submission cancellation must still clear unrelated origin waits & ui.held"
+        );
+    });
+}

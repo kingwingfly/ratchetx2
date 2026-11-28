@@ -1,12 +1,11 @@
 //! The Connect calls, over the browser's `XMLHttpRequest`, which, unlike `fetch`, tells how far
 //! a request's body got.
 
-use std::{
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    rc::Rc,
-};
+#[cfg(any(target_arch = "wasm32", not(test)))]
+use std::cell::Cell;
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
+#[cfg(any(target_arch = "wasm32", not(test)))]
 use futures_channel::oneshot;
 #[cfg(any(target_arch = "wasm32", not(test)))]
 use futures_util::future::{Either, select};
@@ -21,14 +20,13 @@ use session::{
         connect::{ConnectClient, LocalPost},
     },
 };
+#[cfg(any(target_arch = "wasm32", not(test)))]
 use wasm_bindgen::{JsCast, closure::Closure};
 #[cfg(any(target_arch = "wasm32", not(test)))]
-use web_sys::XmlHttpRequestResponseType;
-use web_sys::{ProgressEvent, XmlHttpRequest, XmlHttpRequestUpload};
+use web_sys::{ProgressEvent, XmlHttpRequest, XmlHttpRequestResponseType, XmlHttpRequestUpload};
 
-use crate::util::js_error;
 #[cfg(any(target_arch = "wasm32", not(test)))]
-use crate::util::{monotonic_now_ms, sleep};
+use crate::util::{js_error, monotonic_now_ms, sleep};
 
 /// The handshake and mailbox client of a server.
 pub type Connect = ConnectClient<Fetch>;
@@ -102,6 +100,7 @@ pub fn clock(server: &str) -> ServerClock {
 }
 
 /// Learn the time of `server` from the `Date` of `request`'s response, if it tells it.
+#[cfg(any(target_arch = "wasm32", not(test)))]
 fn observe(server: &str, request: &XmlHttpRequest) {
     if let Ok(Some(date)) = request.get_response_header("date") {
         let clk = clock(server);
@@ -167,6 +166,7 @@ impl Fetch {
     }
 }
 
+#[cfg(any(target_arch = "wasm32", not(test)))]
 #[derive(Clone, Copy)]
 enum XhrOutcome {
     Loaded,
@@ -404,12 +404,14 @@ impl LocalPost for Fetch {
 
 /// A request's handlers, detached when this goes, before the closures they call; and the
 /// request stopped if it has not ended, as when nothing moved, or the call was dropped.
+#[cfg(any(target_arch = "wasm32", not(test)))]
 struct Handlers<'a> {
     request: &'a XmlHttpRequest,
     /// The request's upload, if its progress is handled.
     upload: Option<&'a XmlHttpRequestUpload>,
 }
 
+#[cfg(any(target_arch = "wasm32", not(test)))]
 impl Drop for Handlers<'_> {
     fn drop(&mut self) {
         self.request.set_onprogress(None);
@@ -427,6 +429,7 @@ impl Drop for Handlers<'_> {
 }
 
 /// How long a call outside Connect may take, in milliseconds.
+#[cfg(any(target_arch = "wasm32", not(test)))]
 const CALL_TIMEOUT: u32 = 30_000;
 
 /// Check that a non-Connect auxiliary response body length does not exceed
@@ -446,73 +449,101 @@ pub async fn call(
     path: &str,
     body: Option<&str>,
 ) -> Result<(u16, String), String> {
-    let request = XmlHttpRequest::new().map_err(js_error)?;
-    request
-        .open(method, &format!("{}{path}", server.trim_end_matches('/')))
-        .map_err(js_error)?;
-    request.set_timeout(CALL_TIMEOUT);
-    let (ended, end) = oneshot::channel::<XhrOutcome>();
-    let ended = Rc::new(Cell::new(Some(ended)));
-    let progress = {
-        let ended = ended.clone();
-        let req = request.clone();
-        Closure::<dyn FnMut(ProgressEvent)>::new(move |event: ProgressEvent| {
-            let loaded = event.loaded();
-            let total = if event.length_computable() {
-                event.total()
-            } else {
-                0.0
-            };
-            if loaded > MAX_CALL_RESPONSE_BYTES as f64 || total > MAX_CALL_RESPONSE_BYTES as f64 {
-                let _ = req.abort();
-                if let Some(ended) = ended.take() {
-                    let _ = ended.send(XhrOutcome::Oversized);
-                }
-            }
-        })
-    };
-    let ends = |outcome: XhrOutcome| {
-        let ended = ended.clone();
-        Closure::<dyn FnMut()>::new(move || {
-            if let Some(ended) = ended.take() {
-                let _ = ended.send(outcome);
-            }
-        })
-    };
-    let (load, error, timeout) = (
-        ends(XhrOutcome::Loaded),
-        ends(XhrOutcome::Failed),
-        ends(XhrOutcome::Failed),
-    );
-    // Declared after the closures, so that it goes first, also if this call is dropped.
-    let _handlers = Handlers {
-        request: &request,
-        upload: None,
-    };
-    request.set_onprogress(Some(progress.as_ref().unchecked_ref()));
-    request.set_onload(Some(load.as_ref().unchecked_ref()));
-    request.set_onerror(Some(error.as_ref().unchecked_ref()));
-    request.set_ontimeout(Some(timeout.as_ref().unchecked_ref()));
-    request.send_with_opt_str(body).map_err(js_error)?;
-    match end.await.unwrap_or(XhrOutcome::Failed) {
-        XhrOutcome::Loaded => {}
-        XhrOutcome::Oversized => return Err("the server's response was too large".to_string()),
-        XhrOutcome::Failed => return Err("the server cannot be reached".to_string()),
-    }
-    observe(server, &request);
-    let status = request.status().map_err(js_error)?;
-    // Enforce Content-Length cap BEFORE copying responseText into WASM memory.
-    if let Ok(Some(cl)) = request.get_response_header("content-length")
-        && let Ok(parsed) = cl.trim().parse::<u64>()
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     {
-        check_call_response_size(parsed)?;
+        let fut = MOCK_POST.with(|slot| {
+            let mut handler = slot.borrow_mut();
+            match handler.as_mut() {
+                Some(respond) => respond(
+                    server.trim_end_matches('/'),
+                    path,
+                    body.unwrap_or_default().as_bytes().to_vec(),
+                ),
+                None => Box::pin(std::future::ready(Err(Error::new(
+                    ErrorKind::Connect,
+                    format!("no mock responder installed for {method} {server}{path}"),
+                )))),
+            }
+        });
+        let (status, resp_body) = fut.await.map_err(|e| e.to_string())?;
+        check_call_response_size(resp_body.len() as u64)?;
+        let text = String::from_utf8(resp_body).map_err(|e| e.to_string())?;
+        Ok((status, text))
     }
-    let text = request
-        .response_text()
-        .map_err(js_error)?
-        .unwrap_or_default();
-    check_call_response_size(text.len() as u64)?;
-    Ok((status, text))
+
+    #[cfg(any(target_arch = "wasm32", not(test)))]
+    {
+        let request = XmlHttpRequest::new().map_err(js_error)?;
+        request
+            .open(method, &format!("{}{path}", server.trim_end_matches('/')))
+            .map_err(js_error)?;
+        request.set_timeout(CALL_TIMEOUT);
+        let (ended, end) = oneshot::channel::<XhrOutcome>();
+        let ended = Rc::new(Cell::new(Some(ended)));
+        let progress = {
+            let ended = ended.clone();
+            let req = request.clone();
+            Closure::<dyn FnMut(ProgressEvent)>::new(move |event: ProgressEvent| {
+                let loaded = event.loaded();
+                let total = if event.length_computable() {
+                    event.total()
+                } else {
+                    0.0
+                };
+                if loaded > MAX_CALL_RESPONSE_BYTES as f64 || total > MAX_CALL_RESPONSE_BYTES as f64
+                {
+                    let _ = req.abort();
+                    if let Some(ended) = ended.take() {
+                        let _ = ended.send(XhrOutcome::Oversized);
+                    }
+                }
+            })
+        };
+        let ends = |outcome: XhrOutcome| {
+            let ended = ended.clone();
+            Closure::<dyn FnMut()>::new(move || {
+                if let Some(ended) = ended.take() {
+                    let _ = ended.send(outcome);
+                }
+            })
+        };
+        let (load, error, timeout) = (
+            ends(XhrOutcome::Loaded),
+            ends(XhrOutcome::Failed),
+            ends(XhrOutcome::Failed),
+        );
+        // Declared after the closures, so that it goes first, also if this call is dropped.
+        let _handlers = Handlers {
+            request: &request,
+            upload: None,
+        };
+        request.set_onprogress(Some(progress.as_ref().unchecked_ref()));
+        request.set_onload(Some(load.as_ref().unchecked_ref()));
+        request.set_onerror(Some(error.as_ref().unchecked_ref()));
+        request.set_ontimeout(Some(timeout.as_ref().unchecked_ref()));
+        request.send_with_opt_str(body).map_err(js_error)?;
+        match end.await.unwrap_or(XhrOutcome::Failed) {
+            XhrOutcome::Loaded => {}
+            XhrOutcome::Oversized => {
+                return Err("the server's response was too large".to_string());
+            }
+            XhrOutcome::Failed => return Err("the server cannot be reached".to_string()),
+        }
+        observe(server, &request);
+        let status = request.status().map_err(js_error)?;
+        // Enforce Content-Length cap BEFORE copying responseText into WASM memory.
+        if let Ok(Some(cl)) = request.get_response_header("content-length")
+            && let Ok(parsed) = cl.trim().parse::<u64>()
+        {
+            check_call_response_size(parsed)?;
+        }
+        let text = request
+            .response_text()
+            .map_err(js_error)?
+            .unwrap_or_default();
+        check_call_response_size(text.len() as u64)?;
+        Ok((status, text))
+    }
 }
 
 #[cfg(test)]

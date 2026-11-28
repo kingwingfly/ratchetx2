@@ -285,6 +285,10 @@ impl UploadRegistry {
         self.uploads_restore_completed.get() != self.uploads_restore_epoch.get()
     }
 
+    pub(super) fn waiting_uploads_wait_sign_in(&self) -> bool {
+        self.waiting_uploads_wait_sign_in.get()
+    }
+
     pub(super) fn set_waiting_uploads_wait_sign_in(&self, waits: bool) -> bool {
         self.waiting_uploads_wait_sign_in.replace(waits)
     }
@@ -578,6 +582,10 @@ impl SendQueue {
         self.waits_sign_in.borrow_mut().remove(peer);
     }
 
+    pub(super) fn has_any_sign_in_wait(&self) -> bool {
+        !self.waits_sign_in.borrow().is_empty()
+    }
+
     pub(super) fn clear_all_sign_in_waits(&self) -> bool {
         let mut set = self.waits_sign_in.borrow_mut();
         let had_any = !set.is_empty();
@@ -783,12 +791,20 @@ impl StartupFlow {
         }
     }
 
+    pub(super) fn can_sign_in_here(&self) -> bool {
+        self.can_sign_in_here.get()
+    }
+
     pub(super) fn set_can_sign_in_here(&self, value: bool) {
         self.can_sign_in_here.set(value);
     }
 
     pub(super) fn publish_waits_settings(&self) -> bool {
         self.publish_waits_settings.get()
+    }
+
+    pub(super) fn publish_waits_sign_in(&self) -> bool {
+        self.publish_waits_sign_in.get()
     }
 
     pub(super) fn set_publish_waits_sign_in(&self, waits: bool) -> bool {

@@ -659,10 +659,10 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Start the uploads that waited for this browser to sign in, whose files are still here.
-    /// Returns whether any waiting upload attempt ran.
+    /// Returns whether any waiting upload attempt succeeded.
     pub(super) async fn start_waiting_uploads(self: &Rc<Self>) -> bool {
         let vgen = self.vault_gen();
-        let was_needed = self.uploads.take_start_waiting_needed();
+        let _ = self.uploads.take_start_waiting_needed();
         self.uploads.set_waiting_uploads_wait_sign_in(false);
         let waiting = {
             let guard = self.lock_inner().await;
@@ -675,10 +675,11 @@ impl<V: VaultStore> Engine<V> {
             match inner.vault.uploads(None).await {
                 Ok(uploads) => uploads,
                 Err(e) => {
-                    if was_needed && self.is_live(vgen) {
-                        self.uploads.mark_start_waiting_needed();
-                    }
+                    // R29-P2-1: Always re-arm `start_waiting_needed` on transient IDB read failure
+                    // (even for direct `sign_in()` / `signed_in()` callers) so future `sync()`
+                    // rounds retry without waking in a tight loop.
                     if self.is_live(vgen) {
+                        self.uploads.mark_start_waiting_needed();
                         self.ui.notify(describe(&e));
                     }
                     return false;
@@ -746,13 +747,12 @@ impl<V: VaultStore> Engine<V> {
             let running_guard = scopeguard::guard(id, |id| {
                 self.uploads.stop_running(&id);
             });
-            started_any = true;
             let result = self.start_waiting_with_mode(peer, id, file, true).await;
             drop(running_guard);
-            if let Err(e) = result
-                && self.is_live(vgen)
-            {
-                self.ui.notify(e);
+            match result {
+                Ok(()) => started_any = true,
+                Err(e) if self.is_live(vgen) => self.ui.notify(e),
+                Err(_) => {}
             }
         }
         started_any
@@ -785,17 +785,22 @@ impl<V: VaultStore> Engine<V> {
                 return Ok(());
             }
             let inner = guard.as_mut().ok_or("locked")?;
-            let Some(kept) = inner
-                .vault
-                .upload(&peer, &waiting)
-                .await
-                .map_err(|e| describe(&e))?
-                .filter(|pending| !pending.has_started_state())
-            else {
-                return Ok(());
+            let kept = match inner.vault.upload(&peer, &waiting).await {
+                Ok(Some(pending)) if !pending.has_started_state() => pending,
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if background && self.is_live(vgen) && !self.is_cancelled(&waiting) {
+                        self.uploads.mark_start_waiting_needed();
+                    }
+                    return Err(describe(&e));
+                }
             };
             if file.size() != kept.size {
-                return Err(format!("that is not {}, or it changed", kept.name));
+                let err = format!("that is not {}, or it changed", kept.name);
+                if self.is_live(vgen) && !self.is_cancelled(&waiting) {
+                    self.show_upload(&peer, &kept, UploadState::Paused(err.clone()));
+                }
+                return Err(err);
             }
             // Its message still waits for it, unless this record outlived its start, as forgetting
             // it failed: that message has its attachment, and a second upload must not replace it.
@@ -818,12 +823,19 @@ impl<V: VaultStore> Engine<V> {
             }
             // Validate the waiting message and contact BEFORE allocating a server upload so a
             // missing history entry cannot orphan a server upload or a `started = true` record.
-            let entry_exists = inner
-                .vault
-                .entry(&peer, kept.history_index)
-                .await
-                .map_err(|e| describe(&e))?
-                .is_some();
+            let entry_exists = match inner.vault.entry(&peer, kept.history_index).await {
+                Ok(opt) => opt.is_some(),
+                Err(e) => {
+                    let err = describe(&e);
+                    if self.is_live(vgen) && !self.is_cancelled(&waiting) {
+                        self.uploads
+                            .insert_file((peer, waiting, attachment_key_hash(&kept.key)), file);
+                        self.show_upload(&peer, &kept, UploadState::Paused(err.clone()));
+                        self.uploads.mark_start_waiting_needed();
+                    }
+                    return Err(err);
+                }
+            };
             if !entry_exists {
                 return Err("its message is gone".into());
             }
@@ -886,14 +898,27 @@ impl<V: VaultStore> Engine<V> {
                 return Ok(());
             }
             Err(e) => {
-                if !self.is_live(vgen) || self.is_cancelled(&waiting) {
-                    return Ok(());
-                }
+                // R29-P3-2: Record origin auth proof BEFORE `is_cancelled(&waiting)` (symmetric
+                // with `Ok(upload)`), guarded strictly on `self.is_live(vgen)` inside the helper.
                 if same_server(&server, &origin()) && e.is_server_refusal() {
                     self.on_origin_auth_proven_async(vgen).await;
                 }
+                if !self.is_live(vgen) || self.is_cancelled(&waiting) {
+                    return Ok(());
+                }
+                // R29-P2-1: Replace stale `"waits for you to sign in to the server"` card UI with
+                // the actual error, retain `file` for seamless retry, and re-arm
+                // `start_waiting_needed` ONLY on transient non-refusal failures (never looping on
+                // definitive server refusals like `429 LimitExceeded`).
+                let err = describe(&e);
+                self.uploads
+                    .insert_file((peer, waiting, attachment_key_hash(&kept.key)), file);
+                self.show_upload(&peer, &kept, UploadState::Paused(err.clone()));
+                if !e.is_server_refusal() {
+                    self.uploads.mark_start_waiting_needed();
+                }
                 // Report attachment 404/Unimplemented locally without tripping global update_required.
-                return Err(describe(&e));
+                return Err(err);
             }
         };
         // Cancelled or locked meanwhile: cancel on server outside `self.inner`.
@@ -924,7 +949,14 @@ impl<V: VaultStore> Engine<V> {
                 Err(e) => {
                     drop(guard);
                     let _ = upload.cancel(&Fetch::client(&server)).await;
-                    return Err(describe(&e));
+                    let err = describe(&e);
+                    if self.is_live(vgen) && !self.is_cancelled(&waiting) {
+                        self.uploads
+                            .insert_file((peer, waiting, attachment_key_hash(&kept.key)), file);
+                        self.show_upload(&peer, &kept, UploadState::Paused(err.clone()));
+                        self.uploads.mark_start_waiting_needed();
+                    }
+                    return Err(err);
                 }
             }
         } else {
@@ -1008,6 +1040,12 @@ impl<V: VaultStore> Engine<V> {
             // `ensure_lock_owned()` returned `Err`; preserve the server allocation across teardown.
             if self.is_live(vgen) {
                 let _ = upload.cancel(&Fetch::client(&server)).await;
+                if !self.is_cancelled(&waiting) {
+                    self.uploads
+                        .insert_file((peer, waiting, attachment_key_hash(&kept.key)), file);
+                    self.show_upload(&peer, &kept, UploadState::Paused(e.clone()));
+                    self.uploads.mark_start_waiting_needed();
+                }
             }
             return Err(e);
         }

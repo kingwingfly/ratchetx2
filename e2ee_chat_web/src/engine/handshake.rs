@@ -4797,8 +4797,11 @@ impl<V: VaultStore> Engine<V> {
                     return Err(StartChatError::Cancelled);
                 }
                 guard = self.lock_inner().await;
-                // Check `is_live(vgen)` BEFORE `is_submission_cancelled` / any UI writes per PR 29.2.
-                if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
+                // Check `is_live(vgen)` BEFORE `on_origin_auth_proven_locked` / `is_submission_cancelled`
+                // / any UI writes per PR 29.2, and record origin auth proof BEFORE returning
+                // `Cancelled` so an authenticated `ClaimBundle` still unblocks unrelated latched
+                // origin waits (`R29-P3-2`).
+                if !self.is_live(vgen) {
                     return Err(StartChatError::Cancelled);
                 }
                 {
@@ -4807,6 +4810,9 @@ impl<V: VaultStore> Engine<V> {
                         .ok_or_else(|| StartChatError::Other("locked".into()))?;
                     if signs_in_here {
                         self.on_origin_auth_proven_locked(vgen, inner);
+                    }
+                    if self.is_submission_cancelled(submission_id) {
+                        return Err(StartChatError::Cancelled);
                     }
                     inner.check_outgoing_peer(&peer)?;
                     if inner.contacts.iter().any(|c| c.peer == peer) {

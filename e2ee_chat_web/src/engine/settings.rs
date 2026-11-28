@@ -615,6 +615,18 @@ impl<V: VaultStore> Engine<V> {
                 return Err("locked".into());
             }
             let inner = guard.as_mut().ok_or("locked")?;
+            // R26-P2-1 + R27-P2-1 + R27-P2-3 + R29-P3-2: Clear all origin sign-in waits and
+            // non-`awaits_upload` `ui.held` rows on authenticated `ClaimBundle` completion BEFORE
+            // any early contact/session/config-drift/server-PQ exit.
+            let local_pq_at_claim = pq_cfg.pq_enabled && !pq_cfg.offered_suites().is_empty();
+            if super::same_server(&inner.server, &super::origin())
+                && (claim_res.is_ok()
+                    || claim_res.as_ref().is_err_and(|e| {
+                        super::outbox::is_post_auth_claim_error(e, &pq_cfg, local_pq_at_claim)
+                    }))
+            {
+                self.on_origin_auth_proven_locked(vgen, inner);
+            }
             let Some(index) = inner.contacts.iter().position(|c| c.peer == peer) else {
                 return Err("no such chat".to_string());
             };
@@ -656,29 +668,16 @@ impl<V: VaultStore> Engine<V> {
                 ));
             }
             let claimed = match claim_res {
-                Ok(claimed) => {
-                    // R26-P2-1 + R27-P2-1 + R27-P2-3: Clear all origin sign-in waits and release
-                    // non-`awaits_upload` `ui.held` rows once authenticated `ClaimBundle` succeeds.
-                    if super::same_server(&inner.server, &super::origin()) {
-                        self.on_origin_auth_proven_locked(vgen, inner);
-                    }
-                    claimed
-                }
+                Ok(claimed) => claimed,
                 Err(e) => {
-                    if super::same_server(&inner.server, &super::origin()) {
-                        if e.kind() == ErrorKind::SignInRequired {
-                            if require_approved {
-                                self.queue.mark_waits_sign_in(peer);
-                                self.hold_outbox_head_for_sign_in(inner, &peer);
-                            }
-                            self.ask_sign_in_for(require_approved);
-                        } else if super::outbox::is_post_auth_claim_error(
-                            &e,
-                            &pq_cfg,
-                            inner.local_pq_enabled(),
-                        ) {
-                            self.on_origin_auth_proven_locked(vgen, inner);
+                    if super::same_server(&inner.server, &super::origin())
+                        && e.kind() == ErrorKind::SignInRequired
+                    {
+                        if require_approved {
+                            self.queue.mark_waits_sign_in(peer);
+                            self.hold_outbox_head_for_sign_in(inner, &peer);
                         }
+                        self.ask_sign_in_for(require_approved);
                     }
                     return Err(self.handle_upgrade_pq_error(vgen, inner, &peer, e).await);
                 }

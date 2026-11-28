@@ -1581,6 +1581,18 @@ impl<V: VaultStore> Engine<V> {
                     let Some(inner) = guard.as_mut() else {
                         return Ok(false);
                     };
+                    // R27-P2-1 + R27-P2-2 + R27-P2-3 + R29-P3-2: Any same-origin `PushV2` response
+                    // that passed Worker auth (`Ok` or post-auth server refusal !=
+                    // `SignInRequired`) proves the origin session cookie is valid, even if the
+                    // contact was deleted or recreated while `PushV2` was suspended.
+                    let auth_proven = signs_in_here
+                        && (push_res.is_ok()
+                            || push_res.as_ref().is_err_and(|e| {
+                                e.is_server_refusal() && e.kind() != ErrorKind::SignInRequired
+                            }));
+                    if auth_proven {
+                        self.on_origin_auth_proven_locked(vgen, inner);
+                    }
                     if inner.contact(peer).is_none() {
                         inner.in_flight_push.remove(peer);
                         break;
@@ -1596,23 +1608,13 @@ impl<V: VaultStore> Engine<V> {
                         inner.in_flight_push.remove(peer);
                         break;
                     }
-                    // R27-P2-1 + R27-P2-2 + R27-P2-3: Any same-origin `PushV2` response that
-                    // passed Worker auth (`Ok` or post-auth server refusal != `SignInRequired`)
-                    // proves the origin session cookie is valid, clearing all latched origin
-                    // sign-in waits and releasing non-`awaits_upload` `ui.held` rows. On transient
-                    // non-403 errors after `head.dispatched = true`, release `outgoing.history_index`
-                    // from `ui.held` so it never shows a stale `"waiting for server sign-in"` /
-                    // broken `"Cancel it"` button.
-                    if signs_in_here
-                        && (push_res.is_ok()
-                            || push_res.as_ref().is_err_and(|e| {
-                                e.is_server_refusal() && e.kind() != ErrorKind::SignInRequired
-                            }))
-                    {
-                        self.on_origin_auth_proven_locked(vgen, inner);
-                    } else if push_res
-                        .as_ref()
-                        .is_err_and(|e| e.kind() != ErrorKind::SignInRequired)
+                    // On transient non-403 errors after `head.dispatched = true`, release
+                    // `outgoing.history_index` from `ui.held` so it never shows a stale
+                    // `"waiting for server sign-in"` / broken `"Cancel it"` button.
+                    if !auth_proven
+                        && push_res
+                            .as_ref()
+                            .is_err_and(|e| e.kind() != ErrorKind::SignInRequired)
                     {
                         self.release(peer, outgoing.history_index);
                     }
@@ -2441,13 +2443,16 @@ impl<V: VaultStore> Engine<V> {
         released
     }
 
-    /// Record that an authenticated same-origin RPC passed the relay's sign-in gate while `vgen`
-    /// is still live (`R26-P2-1`, `R27-P2-2`, `R27-P2-3`, `R27-P3-1`, `R28-P2-2`): clears all
-    /// latched origin-wide sign-in wait flags (`publish_waits_sign_in`, `farewells_wait_sign_in`,
-    /// `waiting_uploads_wait_sign_in`, and all peers' `waits_for_sign_in`), resets
-    /// `declined_sign_in`, schedules waiting-upload promotion if any upload waited for sign-in,
-    /// and wakes `Engine::run` whenever any latched wait was actually cleared.
-    pub(super) fn on_origin_auth_proven(&self, vgen: u64) -> bool {
+    /// Whether any same-origin sign-in wait is currently latched across peer outboxes, prekey
+    /// publishing, deletion farewells, or waiting uploads (`R29-P1-1`).
+    pub(super) fn has_latched_sign_in_wait(&self) -> bool {
+        self.queue.has_any_sign_in_wait()
+            || self.startup.publish_waits_sign_in()
+            || self.startup.farewells_wait_sign_in()
+            || self.uploads.waiting_uploads_wait_sign_in()
+    }
+
+    fn on_origin_auth_proven_inner(&self, vgen: u64, wake: bool) -> bool {
         if !self.is_live(vgen) {
             return false;
         }
@@ -2461,10 +2466,20 @@ impl<V: VaultStore> Engine<V> {
         self.startup.reset_declined();
         let cleared =
             cleared_peers || cleared_publish || cleared_farewells || cleared_waiting_uploads;
-        if cleared {
+        if wake && cleared {
             self.wake();
         }
         cleared
+    }
+
+    /// Record that an authenticated same-origin RPC passed the relay's sign-in gate while `vgen`
+    /// is still live (`R26-P2-1`, `R27-P2-2`, `R27-P2-3`, `R27-P3-1`, `R28-P2-2`): clears all
+    /// latched origin-wide sign-in wait flags (`publish_waits_sign_in`, `farewells_wait_sign_in`,
+    /// `waiting_uploads_wait_sign_in`, and all peers' `waits_for_sign_in`), resets
+    /// `declined_sign_in`, schedules waiting-upload promotion if any upload waited for sign-in,
+    /// and wakes `Engine::run` whenever any latched wait was actually cleared.
+    pub(super) fn on_origin_auth_proven(&self, vgen: u64) -> bool {
+        self.on_origin_auth_proven_inner(vgen, true)
     }
 
     /// Locked variant of [`Self::on_origin_auth_proven`] that also releases non-`awaits_upload`
@@ -2483,17 +2498,28 @@ impl<V: VaultStore> Engine<V> {
     /// Async variant of [`Self::on_origin_auth_proven`] for callers that do not currently hold any
     /// lock (acquiring `Engine::inner` only when `ui.held` is non-empty, preserving Lock DAG).
     pub(super) async fn on_origin_auth_proven_async(&self, vgen: u64) {
+        self.on_origin_auth_proven_async_with_wake(vgen, true).await;
+    }
+
+    /// Like [`Self::on_origin_auth_proven_async`] without calling `self.wake()` (used inside
+    /// `Engine::sync` when the current sync round is already about to drain all unblocked work).
+    pub(super) async fn on_origin_auth_proven_async_no_wake(&self, vgen: u64) {
+        self.on_origin_auth_proven_async_with_wake(vgen, false)
+            .await;
+    }
+
+    async fn on_origin_auth_proven_async_with_wake(&self, vgen: u64, wake: bool) {
         if !self.is_live(vgen) {
             return;
         }
-        let cleared = self.on_origin_auth_proven(vgen);
+        let cleared = self.on_origin_auth_proven_inner(vgen, wake);
         if self.ui.held.with_untracked(|held| !held.is_empty()) {
             let guard = self.lock_inner().await;
             if self.is_live(vgen)
                 && let Some(inner) = guard.as_ref()
             {
                 let released = self.release_non_waiting_held(inner);
-                if released && !cleared {
+                if wake && released && !cleared {
                     self.wake();
                 }
             }
@@ -2986,6 +3012,18 @@ impl<V: VaultStore> Engine<V> {
             let Some(inner) = guard.as_mut() else {
                 return Ok(RekeyOutcome::Aborted);
             };
+            // R26-P2-1 + R27-P2-1 + R27-P2-3 + R29-P3-2: Clear all origin sign-in waits and
+            // non-`awaits_upload` `ui.held` rows on authenticated `ClaimBundle` completion BEFORE
+            // any early contact/session/config-drift exit.
+            let local_pq_at_claim = pq_config.pq_enabled && !pq_config.offered_suites().is_empty();
+            if same_server(&inner.server, &origin())
+                && (claim_res.is_ok()
+                    || claim_res
+                        .as_ref()
+                        .is_err_and(|e| is_post_auth_claim_error(e, &pq_config, local_pq_at_claim)))
+            {
+                self.on_origin_auth_proven_locked(vgen, inner);
+            }
             if inner.is_isolated_peer(peer) {
                 return Ok(RekeyOutcome::ContactGone);
             }
@@ -3024,20 +3062,8 @@ impl<V: VaultStore> Engine<V> {
             }
 
             let claimed = match claim_res {
-                Ok(claimed) => {
-                    // R26-P2-1 + R27-P2-1 + R27-P2-3: Authenticated `ClaimBundle` succeeded; clear
-                    // all origin sign-in waits and release non-`awaits_upload` `ui.held` rows.
-                    if same_server(&inner.server, &origin()) {
-                        self.on_origin_auth_proven_locked(vgen, inner);
-                    }
-                    claimed
-                }
+                Ok(claimed) => claimed,
                 Err(e) => {
-                    if same_server(&inner.server, &origin())
-                        && is_post_auth_claim_error(&e, &pq_config, inner.local_pq_enabled())
-                    {
-                        self.on_origin_auth_proven_locked(vgen, inner);
-                    }
                     return self
                         .handle_rekey_session_error(
                             vgen,
@@ -3248,13 +3274,7 @@ impl<V: VaultStore> Engine<V> {
         let Some(inner) = guard.as_mut() else {
             return Ok(RekeyOutcome::Aborted);
         };
-        let Some(contact_cur) = inner.contacts.iter().find(|c| c.peer == *peer) else {
-            return Ok(RekeyOutcome::ContactGone);
-        };
-        if contact_cur.state.conversation_gen != expected_conversation_gen {
-            return Ok(RekeyOutcome::ContactGone);
-        }
-        let matches_session = contact_cur.session.active_id() == new_session_id.as_ref();
+        // R29-P3-2: Proven origin auth clears latched waits even if `peer` was deleted/recreated.
         if signs_in_here
             && (send_res.is_ok()
                 || send_res
@@ -3263,6 +3283,13 @@ impl<V: VaultStore> Engine<V> {
         {
             self.on_origin_auth_proven_locked(vgen, inner);
         }
+        let Some(contact_cur) = inner.contacts.iter().find(|c| c.peer == *peer) else {
+            return Ok(RekeyOutcome::ContactGone);
+        };
+        if contact_cur.state.conversation_gen != expected_conversation_gen {
+            return Ok(RekeyOutcome::ContactGone);
+        }
+        let matches_session = contact_cur.session.active_id() == new_session_id.as_ref();
         match send_res {
             Ok(()) => {
                 if matches_session
@@ -3552,6 +3579,15 @@ impl<V: VaultStore> Engine<V> {
         let Some(inner) = guard.as_mut() else {
             return Ok(false);
         };
+        // R29-P3-2: Proven origin auth clears latched waits even if `peer` was deleted mid-RPC.
+        if signs_in_here
+            && (push_res.is_ok()
+                || push_res
+                    .as_ref()
+                    .is_err_and(|e| e.is_server_refusal() && e.kind() != ErrorKind::SignInRequired))
+        {
+            self.on_origin_auth_proven_locked(vgen, inner);
+        }
         if inner.contact(peer).is_none() {
             return Ok(false);
         }
@@ -3592,14 +3628,6 @@ impl<V: VaultStore> Engine<V> {
                     return Ok(false);
                 }
             }
-        }
-        if signs_in_here
-            && (push_res.is_ok()
-                || push_res
-                    .as_ref()
-                    .is_err_and(|e| e.is_server_refusal() && e.kind() != ErrorKind::SignInRequired))
-        {
-            self.on_origin_auth_proven_locked(vgen, inner);
         }
         match push_res {
             Ok(_) => {

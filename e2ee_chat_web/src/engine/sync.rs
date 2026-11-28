@@ -654,7 +654,7 @@ impl<V: VaultStore> Engine<V> {
                 if !self.is_live(vgen) {
                     return;
                 }
-                let subscribed = {
+                let (signs_in_here, subscribed) = {
                     let mut guard = self.lock_inner().await;
                     if !self.is_live(vgen) {
                         return;
@@ -662,11 +662,13 @@ impl<V: VaultStore> Engine<V> {
                     let Some(inner) = guard.as_mut() else {
                         return;
                     };
-                    inner
+                    let signs_in_here = same_server(&inner.server, &origin());
+                    let subscribed = inner
                         .client
                         .subscription_for_audience(&inner.audience)
                         .map_err(|e| describe(&e))
-                        .and_then(|request| Subscription::open(&inner.server, &request))
+                        .and_then(|request| Subscription::open(&inner.server, &request));
+                    (signs_in_here, subscribed)
                 };
                 if !self.is_live(vgen) {
                     return;
@@ -692,6 +694,15 @@ impl<V: VaultStore> Engine<V> {
                                 Either::Left((Event::Open, _)) => {
                                     self.ui.live.set(true);
                                     retry = RESUBSCRIBE_MIN;
+                                    // R29-P1-1: `/notifications` fails closed behind Worker sign-in
+                                    // auth; reaching `Event::Open` on the same origin proves the
+                                    // browser holds a valid sign-in cookie (e.g. cross-tab login).
+                                    if signs_in_here {
+                                        self.on_origin_auth_proven_async(vgen).await;
+                                        if !self.is_live(vgen) {
+                                            return;
+                                        }
+                                    }
                                     // What came while it was closed has no notification.
                                     self.wake();
                                 }
@@ -933,9 +944,27 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return false;
         }
+        // R29-P1-1: When one or more same-origin channels are latched on sign-in (peer outboxes,
+        // prekey publish, farewells, or waiting uploads), check read-only `GET /auth` so cross-tab
+        // sign-in unlatches every channel in this `sync()` pass even when all outbound RPCs are
+        // paused and `/notifications` is already open or unavailable.
+        if self.startup.can_sign_in_here() && self.has_latched_sign_in_wait() {
+            if let Ok(Some(_)) = self.check_signed_in().await {
+                if !self.is_live(vgen) {
+                    return false;
+                }
+                self.on_origin_auth_proven_async_no_wake(vgen).await;
+                if !self.is_live(vgen) {
+                    return false;
+                }
+                active = true;
+            } else if !self.is_live(vgen) {
+                return false;
+            }
+        }
         // R28-P2-2: Promote `UPLOAD_STATE_WAITING` uploads once cross-tab sign-in is proven by an
-        // authenticated RPC so waiting uploads and messages queued behind them unblock without
-        // requiring an explicit in-tab `sign_in()` / `signed_in()` call.
+        // authenticated RPC (or `GET /auth` above) so waiting uploads and messages queued behind
+        // them unblock without requiring an explicit in-tab `sign_in()` / `signed_in()` call.
         if self.uploads.start_waiting_needed() {
             active |= self.start_waiting_uploads().await;
             if !self.is_live(vgen) {
