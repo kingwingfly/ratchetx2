@@ -2951,6 +2951,16 @@ impl<V: VaultStore> Engine<V> {
             HashMap::new();
         let mut unfinished: Vec<(String, Upload)> = Vec::new();
         let mut unfinished_ids: HashSet<[u8; 16]> = HashSet::new();
+        let mut completed_deletes: Vec<(String, [u8; 16], zeroize::Zeroizing<[u8; 32]>)> =
+            Vec::new();
+        let mut completed_delete_ids: HashSet<[u8; 16]> = HashSet::new();
+        // R21-P2-6: Track uploads queued solely as incomplete announced auto-cancels (not
+        // unannounced and not explicitly cancelled) so if final `PutChunk` finishes during any
+        // subsequent `.await` in `delete_inner`, we cancel neither `unfinished` nor
+        // `completed_deletes` for that already-complete attachment.
+        let mut announced_auto_cancel_ids: HashSet<[u8; 16]> = HashSet::new();
+        let mut explicit_cancel_ids: HashSet<[u8; 16]> = seen_pending_cancels.clone();
+        let tracked_checkpoints = inner.vault.tracked_upload_checkpoints(Some(&peer));
         // R18-P2-5 + R20-P3-1: Include any promoted uploads held in `pending_cancel_rollbacks`
         // (whose cancel-after-promote rollback failed transiently) before `forget_peer` erases
         // their upload tokens and clears `pending_cancel_rollbacks`. Verify `upload_of` BEFORE
@@ -2959,6 +2969,7 @@ impl<V: VaultStore> Engine<V> {
         for rb in self.uploads.pending_cancel_rollbacks_for_peer(&peer) {
             if let Ok(id_arr) = <[u8; 16]>::try_from(rb.pending.id.as_slice()) {
                 upload_ids.insert(id_arr);
+                explicit_cancel_ids.insert(id_arr);
                 if rb.pending.started()
                     && !unfinished_ids.contains(&id_arr)
                     && let Ok(upload) = upload_of(&rb.pending)
@@ -2970,21 +2981,22 @@ impl<V: VaultStore> Engine<V> {
         }
         for (_, pending) in vault_uploads {
             let id_arr = <[u8; 16]>::try_from(pending.id.as_slice()).ok();
-            if let Some(id) = id_arr {
-                intact_upload_ids.insert(id);
-            }
             if !pending.started() {
+                if let Some(id) = id_arr {
+                    intact_upload_ids.insert(id);
+                }
                 continue;
             }
             if let Some(id) = id_arr {
                 vault_uploads_by_id.insert(id, pending.clone());
             }
+            let valid_upload = upload_of(&pending).ok();
             let id_pending_cancel = id_arr.is_some_and(|id| seen_pending_cancels.contains(&id));
-            // R18-P2-5 + R19-P1-5 + R20-P2-4: Cancel on the server ONLY when unannounced,
-            // explicitly pending-cancelled, OR durable chunk progress shows the announced upload is
-            // genuinely incomplete — never let a stale paused UI card, finishing task, or failed
-            // post-`PutChunk` local cache write delete an already-completed attachment for the
-            // recipient.
+            // R18-P2-5 + R19-P1-5 + R20-P2-4 + R21-P2-6: Cancel on the server ONLY when
+            // unannounced, explicitly pending-cancelled, OR durable chunk progress shows the
+            // announced upload is genuinely incomplete — re-checking `is_server_completed` AFTER
+            // `chunks_kept().await` so a final `PutChunk` completing during IDB I/O is never
+            // deleted for the recipient.
             let should_cancel = if !pending.is_announced() || id_pending_cancel {
                 true
             } else {
@@ -2996,21 +3008,50 @@ impl<V: VaultStore> Engine<V> {
                 } else {
                     match inner.vault.chunks_kept(&peer, &pending.id).await {
                         _ if !self.is_live(vgen) => return Err("locked".into()),
-                        Ok(kept) => u64::from(kept) < chunks,
+                        Ok(kept) => {
+                            u64::from(kept) < chunks
+                                && !id_arr.is_some_and(|id| self.uploads.is_server_completed(&id))
+                        }
                         Err(e) => return Err(describe(&e)),
                     }
                 }
             };
-            // R20-P3-1: Check `upload_of(&pending)` BEFORE inserting into `unfinished_ids` so a
-            // malformed `PendingUpload` still falls through to `completed_deletes` key recovery.
-            if should_cancel
-                && id_arr.is_none_or(|id| !unfinished_ids.contains(&id))
-                && let Ok(upload) = upload_of(&pending)
+            // R21-P2-7: Only classify `id` as intact when `upload_of(&pending)` succeeded OR we
+            // proved the upload does not need auto-cancellation. A malformed started `PendingUpload`
+            // needing cancellation must NOT skip delete-key recovery!
+            if let Some(id) = id_arr
+                && (valid_upload.is_some() || !should_cancel)
             {
-                if let Some(id) = id_arr {
-                    unfinished_ids.insert(id);
+                intact_upload_ids.insert(id);
+            }
+            if should_cancel && id_arr.is_none_or(|id| !unfinished_ids.contains(&id)) {
+                let is_announced_auto = pending.is_announced() && !id_pending_cancel;
+                if let Some(upload) = valid_upload {
+                    if let Some(id) = id_arr {
+                        unfinished_ids.insert(id);
+                        if is_announced_auto {
+                            announced_auto_cancel_ids.insert(id);
+                        }
+                    }
+                    unfinished.push((pending.name.clone(), upload));
+                } else if let Some(id) = id_arr
+                    && !completed_delete_ids.contains(&id)
+                {
+                    let cp = tracked_checkpoints
+                        .iter()
+                        .find(|cp| cp.id.as_slice() == id.as_slice());
+                    if let Some((name, key, _)) = self
+                        .resolve_delete_pointer(vgen, inner, &peer, &id, cp)
+                        .await?
+                        && !(is_announced_auto && self.uploads.is_server_completed(&id))
+                    {
+                        completed_delete_ids.insert(id);
+                        if is_announced_auto {
+                            announced_auto_cancel_ids.insert(id);
+                        }
+                        completed_deletes.push((name, id, key.into()));
+                    }
                 }
-                unfinished.push((pending.name.clone(), upload));
             }
         }
         // R18-P2-5 + R19-P2-2 + R20-P2-5 + R20-P2-6: Resolve surviving outgoing delete keys for:
@@ -3018,10 +3059,6 @@ impl<V: VaultStore> Engine<V> {
         //     missing or corrupt (omitted from `vault.uploads()`), and
         // (2) explicit `pending_cancellations` (including any marked concurrently while earlier
         //     vault reads were awaiting) whose upload token could not be cancelled above.
-        let mut completed_deletes: Vec<(String, [u8; 16], zeroize::Zeroizing<[u8; 32]>)> =
-            Vec::new();
-        let mut completed_delete_ids: HashSet<[u8; 16]> = HashSet::new();
-        let tracked_checkpoints = inner.vault.tracked_upload_checkpoints(Some(&peer));
         // Pass A (`R20-P2-5`): incomplete started checkpoints whose separate `PendingUpload` record
         // was missing or corrupt.
         for cp in &tracked_checkpoints {
@@ -3049,23 +3086,33 @@ impl<V: VaultStore> Engine<V> {
                 .resolve_delete_pointer(vgen, inner, &peer, &cp_id, Some(cp))
                 .await?
             {
-                let should_delete =
-                    if is_pending_cancel || cp.upload_state == crate::vault::UPLOAD_STATE_STARTED {
-                        true
+                let is_announced_auto =
+                    !is_pending_cancel && cp.upload_state == crate::vault::UPLOAD_STATE_ANNOUNCED;
+                let should_delete = if is_pending_cancel
+                    || cp.upload_state == crate::vault::UPLOAD_STATE_STARTED
+                {
+                    true
+                } else {
+                    let chunks = attachment::chunk_count(size);
+                    if self.uploads.is_server_completed(&cp_id) || u64::from(cp.uploaded) >= chunks
+                    {
+                        false
                     } else {
-                        let chunks = attachment::chunk_count(size);
-                        if u64::from(cp.uploaded) >= chunks {
-                            false
-                        } else {
-                            match inner.vault.chunks_kept(&peer, &cp_id).await {
-                                _ if !self.is_live(vgen) => return Err("locked".into()),
-                                Ok(kept) => u64::from(kept) < chunks,
-                                Err(e) => return Err(describe(&e)),
+                        match inner.vault.chunks_kept(&peer, &cp_id).await {
+                            _ if !self.is_live(vgen) => return Err("locked".into()),
+                            Ok(kept) => {
+                                u64::from(kept) < chunks
+                                    && !self.uploads.is_server_completed(&cp_id)
                             }
+                            Err(e) => return Err(describe(&e)),
                         }
-                    };
+                    }
+                };
                 if should_delete {
                     completed_delete_ids.insert(cp_id);
+                    if is_announced_auto {
+                        announced_auto_cancel_ids.insert(cp_id);
+                    }
                     completed_deletes.push((name, cp_id, key.into()));
                 }
             }
@@ -3078,6 +3125,7 @@ impl<V: VaultStore> Engine<V> {
         loop {
             for cancel_id in pending_cancel_queue.drain(..) {
                 upload_ids.insert(cancel_id);
+                explicit_cancel_ids.insert(cancel_id);
                 if unfinished_ids.contains(&cancel_id) || completed_delete_ids.contains(&cancel_id)
                 {
                     continue;
@@ -3102,11 +3150,134 @@ impl<V: VaultStore> Engine<V> {
             }
             for cancel_id in self.uploads.pending_cancels_for_peer(&peer) {
                 if seen_pending_cancels.insert(cancel_id) {
+                    explicit_cancel_ids.insert(cancel_id);
                     pending_cancel_queue.push(cancel_id);
                 }
             }
             if pending_cancel_queue.is_empty() {
                 break;
+            }
+        }
+        // R21-P2-8: Pre-resolve surviving delete keys BEFORE `forget_peer` erases history for any
+        // candidate upload lacking a valid upload token (UI upload cards, tracked checkpoints,
+        // malformed `PendingUpload`s, outbox/awaiting attachments, and peer `server_completed`
+        // uploads) so an explicit `cancel_upload` arriving while `forget_peer` is awaiting IDB
+        // still deletes the server object via its delete key.
+        let mut retained_cancel_delete_keys: HashMap<
+            [u8; 16],
+            (String, zeroize::Zeroizing<[u8; 32]>),
+        > = HashMap::new();
+        let mut retain_candidates: HashSet<[u8; 16]> = HashSet::new();
+        for id in self.ui.uploads.with_untracked(|uploads| {
+            uploads
+                .iter()
+                .filter(|u| u.peer == peer)
+                .map(|u| u.id)
+                .collect::<Vec<_>>()
+        }) {
+            retain_candidates.insert(id);
+        }
+        for cp in &tracked_checkpoints {
+            if let Ok(cp_id) = <[u8; 16]>::try_from(cp.id.as_slice()) {
+                retain_candidates.insert(cp_id);
+            }
+        }
+        for (id, pending) in &vault_uploads_by_id {
+            if upload_of(pending).is_err() {
+                retain_candidates.insert(*id);
+            }
+        }
+        for id in self.uploads.server_completed_for_peer(&peer) {
+            retain_candidates.insert(id);
+        }
+        let awaiting_attachment_indices: Vec<u64> = inner
+            .contacts
+            .iter()
+            .find(|c| c.peer == peer)
+            .map(|c| {
+                for o in &c.state.outbox {
+                    if let Ok(att_id) = <[u8; 16]>::try_from(o.attachment_id.as_slice()) {
+                        retain_candidates.insert(att_id);
+                    }
+                }
+                c.state
+                    .awaiting
+                    .iter()
+                    .filter(|a| a.attachment)
+                    .map(|a| a.history_index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for att_idx in awaiting_attachment_indices {
+            match inner.vault.entry(&peer, att_idx).await {
+                _ if !self.is_live(vgen) => return Err("locked".into()),
+                Ok(Some(entry)) => {
+                    if entry.outgoing
+                        && !entry.gone
+                        && let Some(Kind::Attachment(ptr)) =
+                            entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                        && let Ok(id) = <[u8; 16]>::try_from(ptr.id.as_slice())
+                        && !unfinished_ids.contains(&id)
+                        && !completed_delete_ids.contains(&id)
+                        && !vault_uploads_by_id
+                            .get(&id)
+                            .is_some_and(|p| upload_of(p).is_ok())
+                        && let Ok(key) = <[u8; 32]>::try_from(ptr.key.as_slice())
+                    {
+                        retained_cancel_delete_keys.insert(id, (ptr.name.clone(), key.into()));
+                    }
+                }
+                Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {}
+                Err(e) => return Err(describe(&e)),
+            }
+        }
+        for cand_id in retain_candidates {
+            if unfinished_ids.contains(&cand_id)
+                || completed_delete_ids.contains(&cand_id)
+                || retained_cancel_delete_keys.contains_key(&cand_id)
+                || vault_uploads_by_id
+                    .get(&cand_id)
+                    .is_some_and(|p| upload_of(p).is_ok())
+            {
+                continue;
+            }
+            let cp = tracked_checkpoints
+                .iter()
+                .find(|cp| cp.id.as_slice() == cand_id.as_slice());
+            if let Some((name, key, _)) = self
+                .resolve_delete_pointer(vgen, inner, &peer, &cand_id, cp)
+                .await?
+            {
+                retained_cancel_delete_keys.insert(cand_id, (name, key.into()));
+            }
+        }
+        // Final pre-`forget_peer` poll in case an explicit `cancel_upload` arrived while
+        // pre-resolving `retained_cancel_delete_keys` above.
+        for cancel_id in self.uploads.pending_cancels_for_peer(&peer) {
+            upload_ids.insert(cancel_id);
+            explicit_cancel_ids.insert(cancel_id);
+            if unfinished_ids.contains(&cancel_id) || completed_delete_ids.contains(&cancel_id) {
+                continue;
+            }
+            if let Some(pending) = vault_uploads_by_id.get(&cancel_id)
+                && let Ok(upload) = upload_of(pending)
+            {
+                unfinished_ids.insert(cancel_id);
+                unfinished.push((pending.name.clone(), upload));
+            } else if let Some((name, key)) = retained_cancel_delete_keys.remove(&cancel_id) {
+                completed_delete_ids.insert(cancel_id);
+                completed_deletes.push((name, cancel_id, key));
+            } else {
+                let cp = tracked_checkpoints
+                    .iter()
+                    .find(|cp| cp.id.as_slice() == cancel_id.as_slice());
+                if let Some((name, key, _)) = self
+                    .resolve_delete_pointer(vgen, inner, &peer, &cancel_id, cp)
+                    .await?
+                {
+                    completed_delete_ids.insert(cancel_id);
+                    completed_deletes.push((name, cancel_id, key.into()));
+                }
             }
         }
         // The peer is told, on the session as it is now, so that its next message starts a new
@@ -3206,32 +3377,55 @@ impl<V: VaultStore> Engine<V> {
                 .map(|upload| upload.id)
                 .collect::<Vec<_>>()
         }));
-        // R20-P2-6: Pick up any explicit cancellation or rollback marked while `forget_peer`
-        // itself was awaiting IDB, using our retained `vault_uploads_by_id` tokens before clearing
-        // per-peer cancellation markers.
+        // R20-P2-6 + R21-P2-8: Pick up any explicit cancellation or rollback marked while
+        // `forget_peer` itself was awaiting IDB, using retained `vault_uploads_by_id` tokens OR
+        // pre-resolved `retained_cancel_delete_keys` before clearing per-peer markers.
         for cancel_id in self.uploads.pending_cancels_for_peer(&peer) {
             upload_ids.insert(cancel_id);
-            if !unfinished_ids.contains(&cancel_id)
-                && !completed_delete_ids.contains(&cancel_id)
-                && let Some(pending) = vault_uploads_by_id.get(&cancel_id)
-                && let Ok(upload) = upload_of(pending)
-            {
-                unfinished_ids.insert(cancel_id);
-                unfinished.push((pending.name.clone(), upload));
+            explicit_cancel_ids.insert(cancel_id);
+            if !unfinished_ids.contains(&cancel_id) && !completed_delete_ids.contains(&cancel_id) {
+                if let Some(pending) = vault_uploads_by_id.get(&cancel_id)
+                    && let Ok(upload) = upload_of(pending)
+                {
+                    unfinished_ids.insert(cancel_id);
+                    unfinished.push((pending.name.clone(), upload));
+                } else if let Some((name, key)) = retained_cancel_delete_keys.remove(&cancel_id) {
+                    completed_delete_ids.insert(cancel_id);
+                    completed_deletes.push((name, cancel_id, key));
+                }
             }
         }
         for rb in self.uploads.pending_cancel_rollbacks_for_peer(&peer) {
             if let Ok(id_arr) = <[u8; 16]>::try_from(rb.pending.id.as_slice()) {
                 upload_ids.insert(id_arr);
+                explicit_cancel_ids.insert(id_arr);
                 if rb.pending.started()
                     && !unfinished_ids.contains(&id_arr)
-                    && let Ok(upload) = upload_of(&rb.pending)
+                    && !completed_delete_ids.contains(&id_arr)
                 {
-                    unfinished_ids.insert(id_arr);
-                    unfinished.push((rb.pending.name.clone(), upload));
+                    if let Ok(upload) = upload_of(&rb.pending) {
+                        unfinished_ids.insert(id_arr);
+                        unfinished.push((rb.pending.name.clone(), upload));
+                    } else if let Some((name, key)) = retained_cancel_delete_keys.remove(&id_arr) {
+                        completed_delete_ids.insert(id_arr);
+                        completed_deletes.push((name, id_arr, key));
+                    }
                 }
             }
         }
+        // R21-P2-6: Drop any non-explicit announced auto-cancel whose final `PutChunk` succeeded
+        // on the server during `delete_inner`'s vault awaits before clearing `server_completed`.
+        unfinished.retain(|(_, upload)| {
+            let id = upload.id();
+            !(announced_auto_cancel_ids.contains(id)
+                && !explicit_cancel_ids.contains(id)
+                && self.uploads.is_server_completed(id))
+        });
+        completed_deletes.retain(|(_, id, _)| {
+            !(announced_auto_cancel_ids.contains(id)
+                && !explicit_cancel_ids.contains(id)
+                && self.uploads.is_server_completed(id))
+        });
         for id in upload_ids {
             self.uploads.mark_cancelled(id);
             self.uploads.clear_server_completed(&id);

@@ -58,10 +58,11 @@ pub(super) struct UploadRegistry {
     /// Cancellations requested on this page whose local vault settlement failed transiently
     /// (`R16-P2-9`), retried by `Engine::flush` and `Engine::sync` until committed.
     pending_cancellations: RefCell<HashSet<(PublicKey, [u8; 16])>>,
-    /// Uploads whose final `PutChunk` succeeded on the server (`R20-P2-4`) so a subsequent local
-    /// chunk-cache or `forget_upload` storage failure never causes `delete_inner` to cancel an
-    /// already-complete attachment for the recipient.
-    server_completed: RefCell<HashSet<[u8; 16]>>,
+    /// Uploads whose final `PutChunk` succeeded on the server (`R20-P2-4`, `R21-P2-6`, `R21-P2-8`),
+    /// keyed by attachment ID to its peer, so a subsequent local chunk-cache or `forget_upload`
+    /// storage failure never causes `delete_inner` to cancel an already-complete attachment for
+    /// the recipient, while `delete_inner` can still retain delete keys if explicitly cancelled.
+    server_completed: RefCell<HashMap<[u8; 16], PublicKey>>,
     /// Attachments confirmed deleted/missing on the server whose local `HistoryEntry.gone = true`
     /// save failed transiently (`R20-P2-8`), keyed by `(peer, conversation_gen, id)`. Retried by
     /// `sync()` and excluded from unread requeue until durably persisted.
@@ -205,16 +206,24 @@ impl UploadRegistry {
             .collect()
     }
 
-    pub(super) fn mark_server_completed(&self, id: [u8; 16]) {
-        self.server_completed.borrow_mut().insert(id);
+    pub(super) fn mark_server_completed(&self, peer: PublicKey, id: [u8; 16]) {
+        self.server_completed.borrow_mut().insert(id, peer);
     }
 
     pub(super) fn is_server_completed(&self, id: &[u8; 16]) -> bool {
-        self.server_completed.borrow().contains(id)
+        self.server_completed.borrow().contains_key(id)
     }
 
     pub(super) fn clear_server_completed(&self, id: &[u8; 16]) {
         self.server_completed.borrow_mut().remove(id);
+    }
+
+    pub(super) fn server_completed_for_peer(&self, peer: &PublicKey) -> Vec<[u8; 16]> {
+        self.server_completed
+            .borrow()
+            .iter()
+            .filter_map(|(id, p)| (p == peer).then_some(*id))
+            .collect()
     }
 
     pub(super) fn insert_pending_gone(&self, peer: PublicKey, conv_gen: u64, id: [u8; 16]) {

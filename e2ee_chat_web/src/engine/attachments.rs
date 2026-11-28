@@ -1420,11 +1420,17 @@ impl<V: VaultStore> Engine<V> {
         peer: &PublicKey,
         id: [u8; 16],
     ) -> Result<(Vec<ServerDeleteJob>, bool), String> {
-        // R15-P2-7: Route `Error::Corrupt` into the orphan checkpoint cleanup below (matching
-        // `Engine::unlocked` and `Engine::flush`) while still propagating transient `Storage`
-        // errors.
+        // R15-P2-7 + R21-P2-7: Route `Error::Corrupt` AND malformed started `PendingUpload`
+        // records (whose upload token/key fails `upload_of`) into the orphan/history recovery path
+        // below (while still forgetting the malformed IDB record) and propagating transient
+        // `Storage` errors.
+        let mut malformed_pending = false;
         let pending = match inner.vault.upload(peer, &id).await {
             _ if !self.is_live(vgen) => return Err("locked".into()),
+            Ok(Some(pending)) if pending.started() && upload_of(&pending).is_err() => {
+                malformed_pending = true;
+                None
+            }
             Ok(pending) => pending,
             Err(crate::vault::Error::Corrupt(_)) => None,
             Err(e) => return Err(describe(&e)),
@@ -1541,14 +1547,31 @@ impl<V: VaultStore> Engine<V> {
                         Err(e) => return Err(describe(&e)),
                     }
                 }
+                let mut forgot_upload = false;
                 if let Some((idx, dispatched, _)) = outbox_match {
                     if !dispatched {
-                        self.fail_waiting(inner, peer, idx).await?;
-                        if !self.is_live(vgen) {
-                            return Err("locked".into());
+                        if malformed_pending {
+                            self.fail_outbox_and_forget_upload(vgen, inner, peer, idx, &id, false)
+                                .await?;
+                            forgot_upload = true;
+                        } else {
+                            self.fail_waiting(inner, peer, idx).await?;
+                            if !self.is_live(vgen) {
+                                return Err("locked".into());
+                            }
                         }
                     }
                     should_flush = true;
+                }
+                if malformed_pending && !forgot_upload {
+                    inner
+                        .vault
+                        .forget_upload(peer, &id)
+                        .await
+                        .map_err(|e| describe(&e))?;
+                    if !self.is_live(vgen) {
+                        return Err("locked".into());
+                    }
                 }
                 return Ok((delete_jobs, should_flush));
             };
@@ -2061,6 +2084,7 @@ impl<V: VaultStore> Engine<V> {
                 continue;
             }
             self.uploads.mark_cancelled(id);
+            self.uploads.clear_server_completed(&id);
             self.remove_attachment_caches(peer, &id);
             self.ui
                 .uploads
@@ -2088,6 +2112,7 @@ impl<V: VaultStore> Engine<V> {
                 continue;
             }
             self.uploads.mark_cancelled(id);
+            self.uploads.clear_server_completed(&id);
             self.remove_attachment_caches(peer, &id);
             self.ui
                 .uploads
@@ -2241,6 +2266,9 @@ impl<V: VaultStore> Engine<V> {
         drop(running_guard);
         // Cancelled or torn down on `pagehide`: stop quietly without touching UI or IDB.
         if !self.is_live(vgen) || self.is_cancelled(&id) {
+            if self.is_cancelled(&id) {
+                self.uploads.clear_server_completed(&id);
+            }
             return Ok(());
         }
         match uploaded {
@@ -2249,12 +2277,13 @@ impl<V: VaultStore> Engine<V> {
             // go up.
             Ok(false) => {
                 let hint = pending.is_announced().then_some(pending.history_index);
-                self.drop_upload(&peer, id, hint).await?;
-                if pending.is_announced() {
+                let drop_res = self.drop_upload(&peer, id, hint).await;
+                if pending.is_announced() && self.is_live(vgen) {
                     let _ = self
                         .note_gone_by_id(&peer, Some(pending.history_index), &id)
                         .await;
                 }
+                drop_res?;
                 return Err(format!(
                     "{} is no longer on the server, so its upload stopped",
                     pending.name
@@ -2341,6 +2370,9 @@ impl<V: VaultStore> Engine<V> {
                 let mut hist = Vec::new();
                 if let Some(contact) = inner.contact(peer) {
                     contact.state.outbox.retain(|o| o.history_index != idx);
+                    if mark_gone {
+                        contact.record_deleted_attachment(id);
+                    }
                 }
                 match inner.vault.entry(peer, idx).await {
                     Ok(Some(mut entry)) => {
@@ -2397,6 +2429,7 @@ impl<V: VaultStore> Engine<V> {
         // Mark cancelled and drop UI/caches immediately before acquiring `peer_flush_lock` so any
         // concurrent upload task or `Engine::flush` stops before transmitting a dead pointer.
         self.uploads.mark_cancelled(id);
+        self.uploads.clear_server_completed(&id);
         self.remove_attachment_caches(peer, &id);
         self.ui
             .uploads
@@ -2539,8 +2572,16 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        self.drop_upload(&peer, id, Some(index)).await?;
-        self.note_gone(&peer, index, &id).await
+        // R21-P2-9: Always invoke `note_gone` after confirmed server deletion even if
+        // `drop_upload` hits a transient storage error so incoming attachments are still marked
+        // `gone = true` (or queued in `pending_gone` for sync retry).
+        let drop_res = self.drop_upload(&peer, id, Some(index)).await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
+        let gone_res = self.note_gone(&peer, index, &id).await;
+        drop_res?;
+        gone_res
     }
 
     /// Note in the history entry `index` of the chat with `peer` that its attachment `id` is
@@ -2568,6 +2609,18 @@ impl<V: VaultStore> Engine<V> {
         hint_index: Option<u64>,
         id: &[u8; 16],
         expected_gen: Option<u64>,
+    ) -> Result<(), String> {
+        self.note_gone_by_id_for_gen_with_wake(peer, hint_index, id, expected_gen, true)
+            .await
+    }
+
+    pub(super) async fn note_gone_by_id_for_gen_with_wake(
+        &self,
+        peer: &PublicKey,
+        hint_index: Option<u64>,
+        id: &[u8; 16],
+        expected_gen: Option<u64>,
+        wake_on_err: bool,
     ) -> Result<(), String> {
         let vgen = self.vault_gen();
         let res = {
@@ -2606,10 +2659,14 @@ impl<V: VaultStore> Engine<V> {
             }
             Err(e) => {
                 if self.is_live(vgen) {
-                    // R20-P2-8: Queue failed `HistoryEntry.gone = true` saves for retry in `sync()`
-                    // and exclude the deleted pointer from unread requeue until storage recovers.
+                    // R20-P2-8 + R21-P2-11: Queue failed `HistoryEntry.gone = true` saves for
+                    // retry in `sync()` and exclude the deleted pointer from unread requeue until
+                    // storage recovers. Only call `self.wake()` for foreground triggers so a
+                    // persistent storage error does not disable background polling backoff.
                     self.uploads.insert_pending_gone(*peer, conv_gen, *id);
-                    self.wake();
+                    if wake_on_err {
+                        self.wake();
+                    }
                 }
                 Err(e)
             }
@@ -2634,7 +2691,18 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
+        // R21-P2-10 + R21-P3-3: Always record `id` durably in `ContactState.deleted_attachments`
+        // so (a) delayed incoming echoes arriving later are created with `gone = true`, and
+        // (b) reload after a transient history write failure still excludes `id` from unread
+        // requeue once `AppState` saves.
+        let recorded_deleted = inner
+            .contact(peer)
+            .is_some_and(|contact| contact.record_deleted_attachment(id));
         if to_mark.is_empty() {
+            if recorded_deleted && let Err(e) = inner.save_state().await {
+                inner.unsaved_state = true;
+                return Err(describe(&e));
+            }
             return Ok(());
         }
         let marked_indices: Vec<u64> = to_mark.iter().map(|(index, _)| *index).collect();
@@ -2648,10 +2716,21 @@ impl<V: VaultStore> Engine<V> {
         // R20-P2-8: Persist `gone = true` durably BEFORE flipping `self.ui.gone` so a transient
         // storage error never hides the delete control while leaving `gone = false` on disk.
         if !to_save.is_empty() {
-            inner
-                .save(&records(peer, &to_save))
-                .await
-                .map_err(|e| describe(&e))?;
+            if let Err(e) = inner.save(&records(peer, &to_save)).await {
+                inner.unsaved_state = true;
+                if inner.save_state().await.is_ok() {
+                    inner.unsaved_state = false;
+                }
+                return Err(describe(&e));
+            }
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+        } else if recorded_deleted {
+            if let Err(e) = inner.save_state().await {
+                inner.unsaved_state = true;
+                return Err(describe(&e));
+            }
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
@@ -2748,7 +2827,8 @@ impl<V: VaultStore> Engine<V> {
             {
                 return Ok(false);
             }
-            if !self.is_live(vgen) {
+            if !self.is_live(vgen) || self.is_cancelled(upload.id()) {
+                self.uploads.clear_server_completed(upload.id());
                 return Ok(true);
             }
             pending.uploaded = index + 1;
@@ -2757,7 +2837,7 @@ impl<V: VaultStore> Engine<V> {
                 // R20-P2-4: The server now holds every chunk of this attachment. Record completion
                 // immediately so a subsequent local cache-write or `forget_upload` storage error
                 // never lets `delete_inner` cancel an already-complete attachment for the peer.
-                self.uploads.mark_server_completed(*upload.id());
+                self.uploads.mark_server_completed(*peer, *upload.id());
             }
             match self
                 .keep_chunk_for_gen(peer, upload.id(), index, &chunk, None)
@@ -3447,7 +3527,9 @@ impl<V: VaultStore> Engine<V> {
                 };
                 let (deletable, gone) = match &message.body {
                     Body::Remote(remote) => {
-                        let gone = gone || expired(&remote.pointer, now);
+                        let gone = gone
+                            || contact.is_attachment_deleted(&remote.pointer.id)
+                            || expired(&remote.pointer, now);
                         (!gone && uploaded(&remote.pointer), gone)
                     }
                     _ => (false, false),

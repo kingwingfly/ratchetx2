@@ -546,15 +546,51 @@ impl Contact {
             }
         }
         self.state.last_activity = now();
+        // R21-P3-3: If this incoming attachment echo arrived after the attachment was already
+        // confirmed deleted/missing on the server, mark the new history row `gone = true`
+        // immediately so Files and chat views never offer the dead object again.
+        let already_gone = matches!(
+            &content.kind,
+            Some(Kind::Attachment(ptr)) if self.is_attachment_deleted(&ptr.id)
+        );
         let entry = HistoryEntry {
             outgoing: false,
             at: now(),
             content: Some(content),
             place,
+            gone: already_gone,
             ..HistoryEntry::default()
         };
         self.record_last_message(&entry);
         Ok((index, entry))
+    }
+
+    /// Record attachment `id` as durably deleted/missing on the server (`R21-P2-10`, `R21-P3-3`),
+    /// keeping a bounded deduplicated list in `ContactState`. Returns `true` if newly recorded.
+    pub(super) fn record_deleted_attachment(&mut self, id: &[u8; 16]) -> bool {
+        if self
+            .state
+            .deleted_attachments
+            .iter()
+            .any(|existing| existing.as_slice() == id.as_slice())
+        {
+            return false;
+        }
+        self.state.deleted_attachments.push(id.to_vec());
+        const MAX_DELETED_ATTACHMENTS: usize = 256;
+        if self.state.deleted_attachments.len() > MAX_DELETED_ATTACHMENTS {
+            let excess = self.state.deleted_attachments.len() - MAX_DELETED_ATTACHMENTS;
+            self.state.deleted_attachments.drain(..excess);
+        }
+        true
+    }
+
+    /// Whether attachment `id` has already been recorded as deleted/missing on the server.
+    pub(super) fn is_attachment_deleted(&self, id: &[u8]) -> bool {
+        self.state
+            .deleted_attachments
+            .iter()
+            .any(|existing| existing.as_slice() == id)
     }
 
     /// Tell the peer that its message at `clock` was read.

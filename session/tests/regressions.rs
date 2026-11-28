@@ -1361,3 +1361,242 @@ async fn r20_p1_1_p1_2_p1_3_p2_1_pre_manifest_pin_batch_quarantine_started_here_
     assert!(live_session.peer_pq_state().peer_pq_capable);
     assert!(!live_session.peer_pq_state().allow_classical_exception);
 }
+
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[tokio::test]
+async fn r21_p1_1_p1_2_p2_1_p2_2_rekey_pq_disabled_stale_merge_server_disabled_and_manifest_downgrade()
+ {
+    use std::sync::atomic::Ordering;
+
+    let store = SharedStore::default();
+    let (hs, pq_server_enabled) = common::ToggleableHandshake::new(store.clone(), AUDIENCE);
+
+    let mut alice = Client::new(hs.clone());
+    let mut bob = Client::new(hs.clone());
+    alice.publish_v2(AUDIENCE, 5, 5).await.unwrap();
+    bob.publish_v2(AUDIENCE, 5, 5).await.unwrap();
+
+    // 1. R21-P1-1: Disabling local PQ (`pq_enabled = false, strict_pq = false`) on a previously
+    //    PQ-pinned contact must allow `finish_prepare_start_again_v2` to rekey classically without
+    //    tripping `DowngradeDetected` (and without granting persistent `allow_classical_exception`).
+    let mut pq_session = alice
+        .prepare_initiate_v2(
+            AUDIENCE,
+            &bob.identity_key(),
+            &PeerPqState::default(),
+            b"hi-pq",
+            (),
+        )
+        .await
+        .unwrap()
+        .session;
+    assert!(pq_session.peer_pq_state().pq_pinned);
+    assert!(pq_session.peer_pq_state().peer_pq_capable);
+    assert_eq!(pq_session.peer_pq_state().pinned_manifest_seq, 1);
+
+    let mut alice_pq_off = Client::restore(
+        hs.clone(),
+        session::ClientState::try_from(&session::proto::ClientState::from(alice.state())).unwrap(),
+    );
+    alice_pq_off
+        .set_pq_config(PqConfig {
+            pq_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        })
+        .unwrap();
+    pq_session.retire();
+    let claimed_rekey = session::claim_peer_bundle_v2(
+        &hs,
+        AUDIENCE,
+        &bob.identity_key(),
+        pq_session.peer_pq_state(),
+        alice_pq_off.pq_config(),
+        alice_pq_off.clock(),
+    )
+    .await
+    .unwrap();
+    alice_pq_off
+        .finish_prepare_start_again_v2(claimed_rekey, &mut pq_session, b"rekey-cl")
+        .expect("R21-P1-1: classical rekey with local PQ disabled must succeed on PQ-pinned peer");
+    assert!(
+        !pq_session.peer_pq_state().allow_classical_exception,
+        "R21-P1-1: disabling PQ for rekey must not grant persistent allow_classical_exception"
+    );
+    assert!(!pq_session.peer_pq_state().downgrade_detected);
+
+    // 2. R21-P1-2 (Part A & B): Stale locally prepared classical replacement (`started_here`,
+    //    `allow_classical_exception = true`) must NOT overwrite an unmanifested inbound PQ session
+    //    (`pinned_manifest_seq == 0`) AND must NOT restore revoked classical consent onto a newer
+    //    unapproved signed PQ-OFF manifest (`seq = 3`).
+    let mut carol = Client::new(hs.clone());
+    carol
+        .set_pq_config(PqConfig {
+            pq_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        })
+        .unwrap();
+    carol.publish_v2(AUDIENCE, 5, 0).await.unwrap();
+    assert_eq!(carol.manifest_seq(), 1);
+
+    let mut approved_off = PeerPqState::default();
+    approved_off.approve_classical_exception();
+    let stale_seq1_classical = alice
+        .prepare_initiate_v2(
+            AUDIENCE,
+            &carol.identity_key(),
+            &approved_off,
+            b"stale-seq1",
+            (),
+        )
+        .await
+        .unwrap()
+        .session;
+    assert_eq!(stale_seq1_classical.peer_pq_state().pinned_manifest_seq, 1);
+    assert!(
+        stale_seq1_classical
+            .peer_pq_state()
+            .allow_classical_exception
+    );
+
+    // Carol enables PQ (`seq = 2`) and sends Alice an inbound PQ initial (`pinned_manifest_seq == 0`).
+    carol.set_pq_config(PqConfig::default()).unwrap();
+    carol.publish_v2(AUDIENCE, 5, 5).await.unwrap();
+    assert_eq!(carol.manifest_seq(), 2);
+    let carol_to_alice = carol
+        .prepare_initiate_v2(
+            AUDIENCE,
+            &alice.identity_key(),
+            &PeerPqState::default(),
+            b"carol-pq-init",
+            (),
+        )
+        .await
+        .unwrap();
+    let incoming_pq =
+        session::InitialMessageV2::try_from(carol_to_alice.request.message.as_ref().unwrap())
+            .unwrap();
+    let mut live_inbound_pq = match alice
+        .accept_initial_v2(
+            &carol.identity_key(),
+            &PeerPqState::default(),
+            &incoming_pq,
+            (),
+        )
+        .unwrap()
+    {
+        session::AcceptedInitial::Accepted { session, .. } => session,
+        _ => panic!("expected accepted inbound PQ session"),
+    };
+    assert_eq!(live_inbound_pq.peer_pq_state().pinned_manifest_seq, 0);
+    assert!(live_inbound_pq.peer_pq_state().pq_pinned);
+    assert!(live_inbound_pq.peer_pq_state().peer_pq_capable);
+
+    // Part A: stale seq=1 classical MUST fail against unmanifested live inbound PQ (`seq == 0`).
+    let stale_copy_a = session::Session::restore(
+        (),
+        session::SessionState::try_from(&session::proto::SessionState::from(
+            stale_seq1_classical.state(),
+        ))
+        .unwrap(),
+    );
+    let inbound_id_before = live_inbound_pq.active_id().copied();
+    assert_eq!(
+        live_inbound_pq
+            .accept_replacement(stale_copy_a)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::DowngradeDetected,
+        "R21-P1-2A: stale seq=1 classical must not overwrite unmanifested inbound PQ (seq=0)"
+    );
+    assert_eq!(live_inbound_pq.active_id().copied(), inbound_id_before);
+    assert!(live_inbound_pq.peer_pq_state().peer_pq_capable);
+    assert!(!live_inbound_pq.peer_pq_state().allow_classical_exception);
+
+    // Part B: live session observes PQ-ON seq=2, then Carol signs PQ-OFF seq=3 (`allow = false`).
+    alice
+        .get_peer_manifest_for(
+            AUDIENCE,
+            &carol.identity_key(),
+            live_inbound_pq.peer_pq_state_mut(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(live_inbound_pq.peer_pq_state().pinned_manifest_seq, 2);
+    carol
+        .set_pq_config(PqConfig {
+            pq_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        })
+        .unwrap();
+    carol.publish_v2(AUDIENCE, 5, 0).await.unwrap();
+    assert_eq!(carol.manifest_seq(), 3);
+
+    // 3. R21-P2-2: While `downgrade_detected == true`, `get_peer_manifest_for` must refuse to
+    //    clear `peer_pq_capable` via signed PQ-OFF.
+    let mut live_downgraded_pq = live_inbound_pq.peer_pq_state().clone();
+    live_downgraded_pq.downgrade_detected = true;
+    assert_eq!(
+        alice
+            .get_peer_manifest_for(AUDIENCE, &carol.identity_key(), &mut live_downgraded_pq)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::DowngradeDetected,
+        "R21-P2-2: get_peer_manifest_for must not clear peer_pq_capable under downgrade_detected"
+    );
+    assert!(live_downgraded_pq.peer_pq_capable);
+
+    // Without downgrade alarm, live session observes Carol's signed PQ-OFF seq=3 (`allow = false`).
+    alice
+        .get_peer_manifest_for(
+            AUDIENCE,
+            &carol.identity_key(),
+            live_inbound_pq.peer_pq_state_mut(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(live_inbound_pq.peer_pq_state().pinned_manifest_seq, 3);
+    assert!(!live_inbound_pq.peer_pq_state().peer_pq_capable);
+    assert!(!live_inbound_pq.peer_pq_state().allow_classical_exception);
+
+    // Stale seq=1 classical (`allow = true`) MUST be rejected against seq=3 (`allow = false`)!
+    assert_eq!(
+        live_inbound_pq
+            .accept_replacement(stale_seq1_classical)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::DowngradeDetected,
+        "R21-P1-2B: stale seq=1 classical must not restore revoked consent on seq=3 PQ-OFF"
+    );
+    assert!(!live_inbound_pq.peer_pq_state().allow_classical_exception);
+
+    // 4. R21-P2-1: Unpinned peer (`pq_pinned = false, allow = false`) with `downgrade_detected = true`
+    //    hitting a `PQ_ENABLED=false` server must return `DowngradeDetected` (NOT
+    //    `ServerPqDisabledApprovalRequired` / `ClassicalApprovalRequired`).
+    pq_server_enabled.store(false, Ordering::Relaxed);
+    let unpinned_downgraded = PeerPqState {
+        pq_pinned: false,
+        peer_pq_capable: false,
+        allow_classical_exception: false,
+        downgrade_detected: true,
+        ..PeerPqState::default()
+    };
+    let err = session::claim_peer_bundle_v2(
+        &hs,
+        AUDIENCE,
+        &bob.identity_key(),
+        &unpinned_downgraded,
+        alice.pq_config(),
+        alice.clock(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.kind(),
+        ErrorKind::DowngradeDetected,
+        "R21-P2-1: ServerPqDisabled pre-check must reject downgrade_detected as DowngradeDetected"
+    );
+}

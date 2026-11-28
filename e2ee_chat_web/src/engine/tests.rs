@@ -30811,3 +30811,954 @@ fn r20_all_pq_handshake_upload_delete_restore_gone_and_sync_regressions() {
         );
     });
 }
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn r21_all_pq_handshake_probe_upload_delete_gone_and_sync_regressions() {
+    use crate::vault::{
+        CLASSICAL_APPROVAL_NONE, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_NONE,
+        SECURITY_ALERT_PQ_REQUIRED,
+    };
+    use protocol::handshake_v2::{
+        ClaimBundleResponse, GetManifestResponse, ListInitialMessagesResponse,
+    };
+    use session::{PeerPqState, PqConfig, Session, SessionState};
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    let mut pool = futures::executor::LocalPool::new();
+    let _guard = crate::transport::mock_fetch(|_s, _p, _b| Ok((200, vec![])));
+
+    let bundle_from_publish = |p: &session::PreparedPublishV2| {
+        let m = p.request.manifest.clone().unwrap();
+        ClaimBundleResponse {
+            signed_prekey: m.signed_prekey.clone(),
+            signed_prekey_signature: p.request.signed_prekey_signature.clone(),
+            one_time_prekey: None,
+            manifest: Some(m),
+            pq_last_resort: p.request.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: None,
+        }
+    };
+
+    // Part 1: R21-P1-3, R21-P2-2, R21-P2-3, R21-P2-4, R21-P2-5, R21-P2-12.
+    pool.run_until(async {
+        // --- (1a) R21-P1-3: Opening `#chat=<peer>&pq=1` (`pin_pq`) for an already-accepted
+        // classical contact refuses with `DowngradeDetected` (or `PqRequired` under `strict_pq`),
+        // sets `downgrade_detected = true` + alert, and blocks later signed PQ-OFF re-approval! ---
+        let (eng1, peer1, mut bob1) = established_engine_on_localhost().await;
+        let bob1_key = crate::util::key_to_text(&peer1);
+        bob1.set_pq_config(PqConfig {
+            pq_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        })
+        .unwrap();
+        let bob1_off1 = bob1.prepare_publish_v2("localhost", 5, 0).unwrap();
+        let bob1_off1_bundle = bundle_from_publish(&bob1_off1);
+        bob1.commit_publish_v2(bob1_off1);
+        let (eng1_cfg, eng1_clock) = {
+            let guard = eng1.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            (inner.client.pq_config().clone(), inner.client.clock().clone())
+        };
+        let mut bob1_approved = PeerPqState::default();
+        bob1_approved.approve_classical_exception();
+        let bob1_claimed_cl = {
+            let b = bob1_off1_bundle.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, _p, _b| Ok((200, b.encode_to_vec())));
+            session::claim_peer_bundle_v2(
+                &Fetch::client(LOCAL_SERVER),
+                "localhost",
+                &peer1,
+                &bob1_approved,
+                &eng1_cfg,
+                &eng1_clock,
+            )
+            .await
+            .unwrap()
+        };
+        {
+            let mut guard = eng1.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let prep = inner
+                .client
+                .finish_prepare_initiate_v2(
+                    bob1_claimed_cl,
+                    &bob1_approved,
+                    b"hi-cl",
+                    Fetch::client(LOCAL_SERVER),
+                )
+                .unwrap();
+            let mut wire = session::proto::SessionState::from(prep.session.state());
+            wire.known_by_peer = true;
+            wire.initial_message.clear();
+            let c = inner.contact(&peer1).unwrap();
+            c.session = Session::restore(
+                Fetch::client(LOCAL_SERVER),
+                SessionState::try_from(&wire).unwrap(),
+            );
+            c.state.request = false;
+            c.state.provisional = false;
+            c.state.quarantined = false;
+            c.state.security_alert = SECURITY_ALERT_NONE;
+            inner.save_state().await.unwrap();
+        }
+        let sub1 = eng1
+            .startup
+            .begin_new_chat_submit(crate::state::PendingNewChat {
+                key: bob1_key.clone(),
+                name: "Bob".into(),
+                server: None,
+                pq_pinned: true,
+                allow_classical: false,
+                auto_start: false,
+            });
+        let err1 = eng1
+            .start_chat(sub1, &bob1_key, "Bob".into(), None, true, false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err1,
+            super::StartChatError::DowngradeDetected,
+            "R21-P1-3: pin_pq invite against already-accepted classical chat must fail with DowngradeDetected"
+        );
+        let gen1 = {
+            let guard = eng1.inner.lock().await;
+            let c = guard.as_ref().unwrap().contacts.iter().find(|c| c.peer == peer1).unwrap();
+            assert!(c.session.peer_pq_state().pq_pinned);
+            assert!(c.session.peer_pq_state().peer_pq_capable);
+            assert!(c.session.peer_pq_state().downgrade_detected);
+            assert_eq!(c.state.security_alert, SECURITY_ALERT_DOWNGRADE);
+            assert_eq!(c.state.classical_approval_needed, CLASSICAL_APPROVAL_NONE);
+            c.state.conversation_gen
+        };
+        // Bob signs PQ-OFF seq=2; Upgrade MUST NOT clear `peer_pq_capable` or offer Allow classical!
+        let bob1_off2 = bob1.prepare_publish_v2("localhost", 5, 0).unwrap();
+        let bob1_off2_bundle = bundle_from_publish(&bob1_off2);
+        bob1.commit_publish_v2(bob1_off2);
+        {
+            let b = bob1_off2_bundle.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, _p, _b| Ok((200, b.encode_to_vec())));
+            let _ = eng1.upgrade_to_pq_for_gen(peer1, gen1).await;
+        }
+        assert!(
+            {
+                let guard = eng1.inner.lock().await;
+                let c = guard
+                    .as_ref()
+                    .unwrap()
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == peer1)
+                    .unwrap();
+                c.session.peer_pq_state().peer_pq_capable
+                    && c.session.peer_pq_state().downgrade_detected
+                    && c.state.classical_approval_needed == CLASSICAL_APPROVAL_NONE
+            },
+            "R21-P1-3: signed PQ-OFF must not clear peer_pq_capable after pin_pq downgrade"
+        );
+        // Also verify strict_pq=true returns `PqRequired` and persists `downgrade_detected` +
+        // `SECURITY_ALERT_PQ_REQUIRED` on an already-accepted classical contact!
+        {
+            let mut guard = eng1.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner
+                .client
+                .set_pq_config(PqConfig {
+                    pq_enabled: true,
+                    strict_pq: true,
+                    ..PqConfig::default()
+                })
+                .unwrap();
+            let c = inner.contact(&peer1).unwrap();
+            c.session.peer_pq_state_mut().downgrade_detected = false;
+            c.state.security_alert = SECURITY_ALERT_NONE;
+            inner.save_state().await.unwrap();
+        }
+        {
+            let sub_strict = eng1
+                .startup
+                .begin_new_chat_submit(crate::state::PendingNewChat {
+                    key: bob1_key.clone(),
+                    name: "Bob".into(),
+                    server: None,
+                    pq_pinned: true,
+                    allow_classical: false,
+                    auto_start: false,
+                });
+            let err_strict = eng1
+                .start_chat(sub_strict, &bob1_key, "Bob".into(), None, true, false)
+                .await
+                .unwrap_err();
+            assert_eq!(err_strict, super::StartChatError::PqRequired);
+            let guard = eng1.inner.lock().await;
+            let c = guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer1)
+                .unwrap();
+            assert!(c.session.peer_pq_state().downgrade_detected);
+            assert_eq!(c.state.security_alert, SECURITY_ALERT_PQ_REQUIRED);
+        }
+        let _ = bob1_off1_bundle;
+
+        // --- (1b) R21-P2-3: `pending_new_chat_off_pins` seeds `pin_pq` starts (rejecting rollback
+        // to older PQ-ON seq=1) AND transfers onto a crossed inbound contact! ---
+        let (eng2, _existing_peer2, _) = established_engine_on_localhost().await;
+        let mut carol2 = session::Client::new(Fetch::client(LOCAL_SERVER));
+        let carol2_id = carol2.identity_key();
+        let carol2_key = crate::util::key_to_text(&carol2_id);
+        let p_on1 = carol2.prepare_publish_v2("localhost", 5, 5).unwrap();
+        let bundle_on1 = bundle_from_publish(&p_on1);
+        carol2.commit_publish_v2(p_on1);
+        carol2
+            .set_pq_config(PqConfig {
+                pq_enabled: false,
+                strict_pq: false,
+                ..PqConfig::default()
+            })
+            .unwrap();
+        let p_off2 = carol2.prepare_publish_v2("localhost", 5, 0).unwrap();
+        let bundle_off2 = bundle_from_publish(&p_off2);
+        carol2.commit_publish_v2(p_off2);
+        // Step 1: Ordinary New Chat observes signed PQ-OFF seq=2 -> recorded in `pending_new_chat_off_pins`.
+        {
+            let b = bundle_off2.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, _p, _b| Ok((200, b.encode_to_vec())));
+            let sub = eng2.startup.begin_new_chat_submit(crate::state::PendingNewChat {
+                key: carol2_key.clone(),
+                name: "Carol".into(),
+                server: None,
+                pq_pinned: false,
+                allow_classical: false,
+                auto_start: false,
+            });
+            assert_eq!(
+                eng2.start_chat(sub, &carol2_key, "Carol".into(), None, false, false)
+                    .await
+                    .unwrap_err(),
+                super::StartChatError::ClassicalApprovalRequired
+            );
+        }
+        assert_eq!(
+            eng2.startup.new_chat_signed_pq_off(&carol2_id).map(|(s, _)| s),
+            Some(2)
+        );
+        // Step 2: Opening `#chat=<carol>&pq=1` (`pin_pq=true`) against rolled-back PQ-ON seq=1 MUST fail!
+        {
+            let b = bundle_on1.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, _p, _b| Ok((200, b.encode_to_vec())));
+            let sub = eng2.startup.begin_new_chat_submit(crate::state::PendingNewChat {
+                key: carol2_key.clone(),
+                name: "Carol".into(),
+                server: None,
+                pq_pinned: true,
+                allow_classical: false,
+                auto_start: false,
+            });
+            assert_eq!(
+                eng2.start_chat(sub, &carol2_key, "Carol".into(), None, true, false)
+                    .await
+                    .unwrap_err(),
+                super::StartChatError::DowngradeDetected,
+                "R21-P2-3: pin_pq start must seed remembered OFF seq=2 and reject rolled-back ON seq=1"
+            );
+        }
+        // Step 3: Crossed inbound PQ initial arrives (`pinned_manifest_seq == 0`), then `start_chat`
+        // routes through `finish_existing_contact_start_chat` -> transfers `seq = 2` and clears temp pin!
+        let (alice2_id, alice2_bundle) = {
+            let mut guard = eng2.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let id = inner.client.identity_key();
+            let p = inner.client.prepare_publish_v2("localhost", 5, 5).unwrap();
+            let b = bundle_from_publish(&p);
+            inner.client.commit_publish_v2(p);
+            (id, b)
+        };
+        carol2.set_pq_config(PqConfig::default()).unwrap();
+        let carol2_claimed = {
+            let b = alice2_bundle.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, _p, _b| Ok((200, b.encode_to_vec())));
+            session::claim_peer_bundle_v2(
+                &Fetch::client(LOCAL_SERVER),
+                "localhost",
+                &alice2_id,
+                &PeerPqState::default(),
+                carol2.pq_config(),
+                carol2.clock(),
+            )
+            .await
+            .unwrap()
+        };
+        let mut carol_hello = crate::content::Kind::Hello(carol2.make_hello("Carol", 1)).to_bytes();
+        crate::content::stamp(&mut carol_hello, 1);
+        let carol_prep = carol2
+            .finish_prepare_initiate_v2(
+                carol2_claimed,
+                &PeerPqState::default(),
+                &carol_hello,
+                Fetch::client(LOCAL_SERVER),
+            )
+            .unwrap();
+        let carol_inc = Incoming::try_from(carol_prep.request.message.as_ref().unwrap()).unwrap();
+        {
+            let mut guard = eng2.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let mut batch = super::handshake::InitialBatch::default();
+            let _ = eng2.process_initial(inner, &carol2_id, &carol_inc, &mut batch);
+            inner.save_state().await.unwrap();
+        }
+        {
+            let _mock = crate::transport::mock_fetch(|_s, _p, _b| Ok((200, vec![])));
+            let sub = eng2.startup.begin_new_chat_submit(crate::state::PendingNewChat {
+                key: carol2_key.clone(),
+                name: "Carol".into(),
+                server: None,
+                pq_pinned: true,
+                allow_classical: false,
+                auto_start: false,
+            });
+            eng2.start_chat(sub, &carol2_key, "Carol".into(), None, true, false)
+                .await
+                .unwrap();
+        }
+        {
+            let guard = eng2.inner.lock().await;
+            let c = guard.as_ref().unwrap().contacts.iter().find(|c| c.peer == carol2_id).unwrap();
+            assert_eq!(
+                c.session.peer_pq_state().pinned_manifest_seq,
+                2,
+                "R21-P2-3: crossed existing contact must inherit remembered OFF seq=2"
+            );
+            assert!(c.session.peer_pq_state().peer_pq_capable);
+            assert!(eng2.startup.new_chat_signed_pq_off(&carol2_id).is_none());
+        }
+
+        // --- (1c) R21-P2-4: Failed manual PQ upgrade on an established peer-confirmed classical
+        // chat still commits a newer verified signed PQ-OFF seq=3 monotonically! ---
+        let (eng3, peer3, mut bob3) = established_engine_on_localhost().await;
+        bob3.set_pq_config(PqConfig {
+            pq_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        })
+        .unwrap();
+        let b3_off1 = bob3.prepare_publish_v2("localhost", 5, 0).unwrap();
+        let b3_off1_bundle = bundle_from_publish(&b3_off1);
+        bob3.commit_publish_v2(b3_off1);
+        bob3.set_pq_config(PqConfig::default()).unwrap();
+        let b3_on2 = bob3.prepare_publish_v2("localhost", 5, 5).unwrap();
+        let b3_on2_bundle = bundle_from_publish(&b3_on2);
+        bob3.commit_publish_v2(b3_on2);
+        bob3.set_pq_config(PqConfig {
+            pq_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        })
+        .unwrap();
+        let b3_off3 = bob3.prepare_publish_v2("localhost", 5, 0).unwrap();
+        let b3_off3_bundle = bundle_from_publish(&b3_off3);
+        bob3.commit_publish_v2(b3_off3);
+        let b3_off3_seq = bob3.manifest_seq();
+        let (eng3_cfg, eng3_clock) = {
+            let guard = eng3.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            (inner.client.pq_config().clone(), inner.client.clock().clone())
+        };
+        let mut b3_approved = PeerPqState::default();
+        b3_approved.approve_classical_exception();
+        let b3_claimed_cl = {
+            let b = b3_off1_bundle.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, _p, _b| Ok((200, b.encode_to_vec())));
+            session::claim_peer_bundle_v2(
+                &Fetch::client(LOCAL_SERVER),
+                "localhost",
+                &peer3,
+                &b3_approved,
+                &eng3_cfg,
+                &eng3_clock,
+            )
+            .await
+            .unwrap()
+        };
+        let gen3 = {
+            let mut guard = eng3.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let prep = inner
+                .client
+                .finish_prepare_initiate_v2(
+                    b3_claimed_cl,
+                    &b3_approved,
+                    b"hi-cl-3",
+                    Fetch::client(LOCAL_SERVER),
+                )
+                .unwrap();
+            let mut wire = session::proto::SessionState::from(prep.session.state());
+            wire.known_by_peer = true;
+            wire.initial_message.clear();
+            let c = inner.contact(&peer3).unwrap();
+            c.session = Session::restore(
+                Fetch::client(LOCAL_SERVER),
+                SessionState::try_from(&wire).unwrap(),
+            );
+            let conv_gen = c.state.conversation_gen;
+            inner.save_state().await.unwrap();
+            conv_gen
+        };
+        {
+            let b = b3_off3_bundle.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, _p, _b| Ok((200, b.encode_to_vec())));
+            assert!(eng3.upgrade_to_pq_for_gen(peer3, gen3).await.is_err());
+        }
+        {
+            let guard = eng3.inner.lock().await;
+            let c = guard.as_ref().unwrap().contacts.iter().find(|c| c.peer == peer3).unwrap();
+            assert_eq!(
+                c.session.peer_pq_state().pinned_manifest_seq,
+                b3_off3_seq,
+                "R21-P2-4: failed upgrade on established classical chat must still advance pinned_manifest_seq"
+            );
+            assert!(c.session.peer_pq_state().allow_classical_exception);
+        }
+        // Subsequent upgrade encountering rolled-back ON seq=2 MUST fail with downgrade error!
+        {
+            let b = b3_on2_bundle.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, _p, _b| Ok((200, b.encode_to_vec())));
+            let err = eng3.upgrade_to_pq_for_gen(peer3, gen3).await.unwrap_err();
+            assert!(
+                err.to_lowercase().contains("downgrade"),
+                "R21-P2-4: rollback to ON seq=2 after committing OFF seq=3 must fail as downgrade, got {err}"
+            );
+        }
+
+        // --- (1d) R21-P2-5 & R21-P2-2: `apply_verified_probe_manifest` preserves approved
+        // `ServerPqDisabled` fallback on signed PQ-ON probe AND refuses to clear `peer_pq_capable`
+        // under a live downgrade alarm on signed PQ-OFF probe! ---
+        let (eng4, peer4, mut bob4) = established_engine_on_localhost().await;
+        bob4.set_pq_config(PqConfig {
+            pq_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        })
+        .unwrap();
+        let b4_off1 = bob4.prepare_publish_v2("localhost", 5, 0).unwrap();
+        let b4_off1_bundle = bundle_from_publish(&b4_off1);
+        bob4.commit_publish_v2(b4_off1);
+        let (eng4_cfg, eng4_clock) = {
+            let guard = eng4.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            (inner.client.pq_config().clone(), inner.client.clock().clone())
+        };
+        let mut b4_approved = PeerPqState::default();
+        b4_approved.approve_classical_exception();
+        let b4_claimed_cl = {
+            let b = b4_off1_bundle.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, _p, _b| Ok((200, b.encode_to_vec())));
+            session::claim_peer_bundle_v2(
+                &Fetch::client(LOCAL_SERVER),
+                "localhost",
+                &peer4,
+                &b4_approved,
+                &eng4_cfg,
+                &eng4_clock,
+            )
+            .await
+            .unwrap()
+        };
+        {
+            let mut guard = eng4.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let prep = inner
+                .client
+                .finish_prepare_initiate_v2(
+                    b4_claimed_cl,
+                    &b4_approved,
+                    b"hi-cl-4",
+                    Fetch::client(LOCAL_SERVER),
+                )
+                .unwrap();
+            let c = inner.contact(&peer4).unwrap();
+            c.session = prep.session;
+            let ppq_init = c.session.peer_pq_state_mut();
+            ppq_init.pq_pinned = false;
+            ppq_init.peer_pq_capable = true;
+            ppq_init.allow_classical_exception = true;
+            ppq_init.downgrade_detected = false;
+            ppq_init.pinned_manifest_seq = 1;
+            ppq_init.pinned_manifest_digest = Some([0x11; 32]);
+            let conv_gen = c.state.conversation_gen;
+            let probe_on = super::sync::SpkRotationProbe {
+                rotated: false,
+                manifest_seq: 1,
+                manifest_digest: [0x11; 32],
+                pq_enabled: true,
+            };
+            assert!(
+                eng4.apply_verified_probe_manifest(eng4.vault_gen(), inner, &peer4, conv_gen, &probe_on)
+                    .await
+            );
+            let ppq = inner.contact(&peer4).unwrap().session.peer_pq_state();
+            assert!(
+                !ppq.pq_pinned && ppq.allow_classical_exception && ppq.peer_pq_capable,
+                "R21-P2-5: unchanged PQ-ON manifest probe must NOT revoke approved ServerPqDisabled fallback"
+            );
+
+            // Now test R21-P2-2: PQ-pinned + downgrade_detected=true + pinned_manifest_seq=0
+            // probed with signed PQ-OFF seq=2 must NOT clear `peer_pq_capable`!
+            let c = inner.contact(&peer4).unwrap();
+            let ppq_m = c.session.peer_pq_state_mut();
+            ppq_m.pq_pinned = true;
+            ppq_m.peer_pq_capable = true;
+            ppq_m.pinned_manifest_seq = 0;
+            ppq_m.pinned_manifest_digest = None;
+            ppq_m.downgrade_detected = true;
+            c.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+            let probe_off = super::sync::SpkRotationProbe {
+                rotated: false,
+                manifest_seq: 2,
+                manifest_digest: [0x22; 32],
+                pq_enabled: false,
+            };
+            assert!(
+                eng4.apply_verified_probe_manifest(eng4.vault_gen(), inner, &peer4, conv_gen, &probe_off)
+                    .await
+            );
+            let ppq2 = inner.contact(&peer4).unwrap().session.peer_pq_state();
+            assert!(
+                ppq2.peer_pq_capable && ppq2.downgrade_detected,
+                "R21-P2-2: probe signed PQ-OFF must NOT clear peer_pq_capable under downgrade_detected"
+            );
+        }
+
+        // --- (1e) R21-P2-12: Late 403 in `ensure_session_for_outbox` after chat recreation must
+        // NOT open `Dialog::SignIn`, mark `waits_for_sign_in`, or record `approval_backoff`! ---
+        let (eng5, peer5, mut bob5) = established_engine_on_localhost().await;
+        let b5_pub = bob5.prepare_publish_v2("localhost", 5, 5).unwrap();
+        let b5_bundle = bundle_from_publish(&b5_pub);
+        bob5.commit_publish_v2(b5_pub);
+        {
+            let mut guard = eng5.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.contact(&peer5).unwrap().session.retire();
+            inner.save_state().await.unwrap();
+        }
+        leptos::prelude::Set::set(&eng5.ui.dialog, Some(crate::state::Dialog::Settings));
+        let outcome5 = {
+            let eng = eng5.clone();
+            let b = b5_bundle.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _body| {
+                let path = path.to_string();
+                let eng = eng.clone();
+                let b = b.clone();
+                async move {
+                    if path.ends_with("/ClaimBundle") {
+                        Ok((200, b.encode_to_vec()))
+                    } else if path.ends_with("/SendInitialV2") {
+                        // Simulate chat deleted & recreated (new `conversation_gen`) before 403 arrives!
+                        let mut guard = eng.inner.lock().await;
+                        let inner = guard.as_mut().unwrap();
+                        inner.contact(&peer5).unwrap().state.conversation_gen += 1;
+                        Ok((
+                            403,
+                            br#"{"code":"permission_denied","message":"sign in"}"#.to_vec(),
+                        ))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            let mut deletes = Vec::new();
+            eng5.ensure_session_for_outbox(eng5.vault_gen(), &peer5, &mut deletes)
+                .await
+                .unwrap()
+        };
+        assert!(matches!(outcome5, super::outbox::RekeyOutcome::ContactGone));
+        assert!(
+            !eng5.queue.waits_for_sign_in(&peer5)
+                && !eng5.queue.is_approval_backed_off(&peer5)
+                && eng5.ui.dialog.get_untracked() == Some(crate::state::Dialog::Settings),
+            "R21-P2-12: late SendInitialV2 403 on replaced chat must not open SignIn or back off"
+        );
+    });
+
+    // Part 2: R21-P2-6, R21-P2-7, R21-P2-8, R21-P2-9, R21-P2-10, R21-P2-11, R21-P3-1, R21-P3-3.
+    pool.run_until(async {
+        // --- (2a) R21-P2-6: Final `PutChunk` completing (`mark_server_completed`) during
+        // `delete_inner` must NOT cancel the completed announced attachment on the server! ---
+        let (eng6, peer6, _) = established_engine_on_localhost().await;
+        let att6 = [0xe1u8; 16];
+        let gen6 = {
+            let mut guard = eng6.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let mut p = crate::vault::PendingUpload::default();
+            p.id = att6.to_vec();
+            p.token = vec![0x71u8; 16];
+            p.key = vec![0x72u8; 32];
+            p.name = "race_complete.bin".into();
+            p.size = 64;
+            p.uploaded = 0; // Looks incomplete when `delete_inner` checks `chunks_kept`!
+            p.announced = true;
+            p.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+            inner.vault.save_upload(&peer6, &p).await.unwrap();
+            let eng_hook = eng6.clone();
+            *inner.vault.on_save.borrow_mut() = Some(Box::new(move || {
+                // Final `PutChunk` finishes before `forget_peer` completes!
+                eng_hook.uploads.mark_server_completed(peer6, att6);
+            }));
+            inner.contact(&peer6).unwrap().state.conversation_gen
+        };
+        let del6 = Rc::new(Cell::new(0usize));
+        {
+            let d = del6.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let d = d.clone();
+                async move {
+                    if path.ends_with("/DeleteAttachment") {
+                        d.set(d.get() + 1);
+                    }
+                    Ok((200, vec![]))
+                }
+            });
+            eng6.delete_for_gen(peer6, gen6).await.unwrap();
+        }
+        assert_eq!(
+            del6.get(),
+            0,
+            "R21-P2-6: announced attachment that completed during delete_inner must NOT be cancelled"
+        );
+
+        // --- (2b) R21-P2-7: Direct `delete_for_gen` (WITHOUT `pending_cancellations`) on a
+        // malformed started `PendingUpload` recovers its delete key; AND `cancel_upload` on a
+        // malformed started `PendingUpload` settles cleanly without wedging! ---
+        let (eng7, peer7, _) = established_engine_on_localhost().await;
+        let att7_del = [0xe2u8; 16];
+        let att7_can = [0xe3u8; 16];
+        let gen7 = {
+            let mut guard = eng7.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let ptr_del = crate::content::AttachmentPointer {
+                id: att7_del.to_vec(),
+                key: vec![0x73u8; 32],
+                size: 64,
+                name: "malformed_direct_del.bin".into(),
+                mime: "application/octet-stream".into(),
+                expires: u64::MAX,
+            };
+            let v_del = inner.add(&peer7, Kind::Attachment(ptr_del), false).await.unwrap();
+            let mut bad_del = crate::vault::PendingUpload::default();
+            bad_del.id = att7_del.to_vec();
+            bad_del.token = vec![0xaa, 0xbb, 0xcc]; // Malformed 3-byte token!
+            bad_del.key = vec![0x73u8; 32];
+            bad_del.name = "malformed_direct_del.bin".into();
+            bad_del.size = 64;
+            bad_del.announced = true;
+            bad_del.history_index = v_del.index;
+            bad_del.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+            inner.vault.save_upload(&peer7, &bad_del).await.unwrap();
+
+            let ptr_can = crate::content::AttachmentPointer {
+                id: att7_can.to_vec(),
+                key: vec![0x74u8; 32],
+                size: 64,
+                name: "malformed_cancel.bin".into(),
+                mime: "application/octet-stream".into(),
+                expires: u64::MAX,
+            };
+            let v_can = inner.add(&peer7, Kind::Attachment(ptr_can), false).await.unwrap();
+            let mut bad_can = crate::vault::PendingUpload::default();
+            bad_can.id = att7_can.to_vec();
+            bad_can.token = vec![0x11, 0x22, 0x33]; // Malformed 3-byte token!
+            bad_can.key = vec![0x74u8; 32];
+            bad_can.name = "malformed_cancel.bin".into();
+            bad_can.size = 64;
+            bad_can.announced = true;
+            bad_can.history_index = v_can.index;
+            bad_can.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+            inner.vault.save_upload(&peer7, &bad_can).await.unwrap();
+            inner.contact(&peer7).unwrap().state.conversation_gen
+        };
+        let deleted7 = Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
+        {
+            let d = deleted7.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, body| {
+                let path = path.to_string();
+                let d = d.clone();
+                async move {
+                    if path.ends_with("/DeleteAttachment") {
+                        let req =
+                            protocol::attachment::DeleteAttachmentRequest::decode(body.as_slice())
+                                .unwrap();
+                        d.borrow_mut().push(req.id.to_vec());
+                    }
+                    Ok((200, vec![]))
+                }
+            });
+            // Explicit cancel on malformed PendingUpload MUST settle cleanly (not wedge)!
+            eng7.cancel_upload(peer7, att7_can).await.unwrap();
+            assert!(
+                eng7.uploads.pending_cancels().is_empty(),
+                "R21-P2-7: cancel_upload on malformed PendingUpload must clear pending_cancellations"
+            );
+            // Direct chat deletion (no pending cancel for `att7_del`) MUST still recover & delete it!
+            eng7.delete_for_gen(peer7, gen7).await.unwrap();
+        }
+        assert!(
+            deleted7.borrow().contains(&att7_can.to_vec())
+                && deleted7.borrow().contains(&att7_del.to_vec()),
+            "R21-P2-7: both malformed cancel_upload and direct delete_for_gen must delete via history key"
+        );
+
+        // --- (2c) R21-P2-8: Explicit `cancel_upload` arriving during `forget_peer` for a
+        // completed announced upload whose `PendingUpload` is missing still deletes on server! ---
+        let (eng8, peer8, _) = established_engine_on_localhost().await;
+        let att8 = [0xe4u8; 16];
+        let gen8 = {
+            let mut guard = eng8.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let ptr8 = crate::content::AttachmentPointer {
+                id: att8.to_vec(),
+                key: vec![0x75u8; 32],
+                size: 64,
+                name: "missing_pending_race.bin".into(),
+                mime: "application/octet-stream".into(),
+                expires: u64::MAX,
+            };
+            let v8 = inner.add(&peer8, Kind::Attachment(ptr8), false).await.unwrap();
+            // PendingUpload already forgotten; delete key lives only in outgoing history + awaiting!
+            let c = inner.contact(&peer8).unwrap();
+            c.state.outbox.clear();
+            c.state.awaiting.push(crate::vault::Awaiting {
+                history_index: v8.index,
+                place: 1,
+                read: false,
+                content_digest: vec![],
+                attachment: true,
+            });
+            let conv_gen = c.state.conversation_gen;
+            let eng_hook = eng8.clone();
+            *inner.vault.on_save.borrow_mut() = Some(Box::new(move || {
+                eng_hook.uploads.insert_pending_cancel(peer8, att8);
+            }));
+            conv_gen
+        };
+        let del8 = Rc::new(Cell::new(0usize));
+        {
+            let d = del8.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let d = d.clone();
+                async move {
+                    if path.ends_with("/DeleteAttachment") {
+                        d.set(d.get() + 1);
+                    }
+                    Ok((200, vec![]))
+                }
+            });
+            eng8.delete_for_gen(peer8, gen8).await.unwrap();
+        }
+        assert_eq!(
+            del8.get(),
+            1,
+            "R21-P2-8: cancel_upload during forget_peer with missing PendingUpload must still delete via retained key"
+        );
+
+        // --- (2d) R21-P2-9, R21-P2-10, R21-P2-11, R21-P3-1, R21-P3-3 ---
+        let (eng9, peer9, _) = established_engine_on_localhost().await;
+        let att9_in = [0xe5u8; 16];
+        let ptr9_in = crate::content::AttachmentPointer {
+            id: att9_in.to_vec(),
+            key: vec![0x76u8; 32],
+            size: 64,
+            name: "incoming_only.bin".into(),
+            mime: "application/octet-stream".into(),
+            expires: u64::MAX,
+        };
+        let in_idx9 = {
+            let mut guard = eng9.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.state.published_at = crate::util::now();
+            inner.state.needs_publish = false;
+            let (idx, entry) = inner
+                .contact(&peer9)
+                .unwrap()
+                .add_received(
+                    crate::content::Content {
+                        clock: 50,
+                        kind: Some(Kind::Attachment(ptr9_in.clone())),
+                        events: None,
+                    },
+                    false,
+                )
+                .unwrap();
+            inner.save(&[(peer9, idx, entry)]).await.unwrap();
+            // Force `drop_upload`'s `vault.upload` lookup to fail transiently!
+            inner.vault.fail_upload_read.set(true);
+            idx
+        };
+        // R21-P3-1: `drop_upload` clears `server_completed`.
+        eng9.uploads.mark_server_completed(peer9, att9_in);
+        {
+            let _mock = crate::transport::mock_fetch(|_s, _p, _b| Ok((200, vec![])));
+            // `drop_upload` fails transiently, yet `note_gone` MUST still run and mark incoming gone!
+            assert!(
+                eng9.delete_attachment(peer9, in_idx9, &ptr9_in)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            !eng9.uploads.is_server_completed(&att9_in),
+            "R21-P3-1: drop_upload must clear server_completed"
+        );
+        {
+            let mut guard = eng9.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.vault.fail_upload_read.set(false);
+            let e_in = inner.vault.entry(&peer9, in_idx9).await.unwrap().unwrap();
+            assert!(
+                e_in.gone,
+                "R21-P2-9: delete_attachment must still mark incoming entry gone when drop_upload fails"
+            );
+            // R21-P3-3: Delayed incoming echo arriving AFTER deletion is created with `gone = true`!
+            let (echo_idx, echo_entry) = inner
+                .contact(&peer9)
+                .unwrap()
+                .add_received(
+                    crate::content::Content {
+                        clock: 51,
+                        kind: Some(Kind::Attachment(ptr9_in.clone())),
+                        events: None,
+                    },
+                    false,
+                )
+                .unwrap();
+            assert!(
+                echo_entry.gone,
+                "R21-P3-3: delayed incoming echo of deleted attachment must arrive with gone=true"
+            );
+            inner.save(&[(peer9, echo_idx, echo_entry)]).await.unwrap();
+        }
+        let files9 = eng9.files(peer9).await.unwrap();
+        assert!(
+            files9.iter().all(|f| f.gone && !f.deletable),
+            "R21-P3-3: Files view must report delayed echo of deleted attachment as gone and non-deletable"
+        );
+
+        // R21-P2-10 + R21-P2-11: Failed `note_gone` save retried inside `sync()` must NOT spin
+        // `queue.take_wake()`, AND once `deleted_attachments` is persisted in `AppState`, reload
+        // + unread requeue after peer deletion MUST still exclude the deleted pointer even if
+        // `HistoryEntry.gone` was still `false`!
+        let att9_out = [0xe6u8; 16];
+        let ptr9_out = crate::content::AttachmentPointer {
+            id: att9_out.to_vec(),
+            key: vec![0x77u8; 32],
+            size: 64,
+            name: "reload_gone.bin".into(),
+            mime: "application/octet-stream".into(),
+            expires: u64::MAX,
+        };
+        let out_idx9 = {
+            let mut guard = eng9.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let v = inner
+                .add(&peer9, Kind::Attachment(ptr9_out.clone()), false)
+                .await
+                .unwrap();
+            let c = inner.contact(&peer9).unwrap();
+            let digest =
+                crate::vault::content_kind_digest(&Kind::Attachment(ptr9_out.clone()).to_bytes());
+            c.state.outbox.clear();
+            c.state.awaiting.push(crate::vault::Awaiting {
+                history_index: v.index,
+                place: 2,
+                read: false,
+                content_digest: digest.to_vec(),
+                attachment: true,
+            });
+            inner.save_state().await.unwrap();
+            inner.vault.fail_save.set(true);
+            v.index
+        };
+        assert!(
+            eng9.note_gone_by_id(&peer9, Some(out_idx9), &att9_out)
+                .await
+                .is_err()
+        );
+        // Drain foreground wake before testing background `sync()` backoff (`R21-P2-11`).
+        let _ = eng9.queue.take_wake();
+        {
+            let _mock = crate::transport::mock_fetch_async(|_s, path, _b| {
+                let path = path.to_string();
+                async move {
+                    if path.ends_with("/ListInitialMessages") {
+                        Ok((
+                            200,
+                            ListInitialMessagesResponse {
+                                messages: vec![],
+                                has_more: false,
+                            }
+                            .encode_to_vec(),
+                        ))
+                    } else if path.ends_with("/FetchSigned") {
+                        Ok((
+                            200,
+                            protocol::mailbox_v2::FetchSignedResponse {
+                                messages: vec![],
+                                has_more: false,
+                            }
+                            .encode_to_vec(),
+                        ))
+                    } else if path.ends_with("/GetManifest") {
+                        Ok((200, GetManifestResponse { manifest: None }.encode_to_vec()))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            eng9.sync().await;
+        }
+        assert!(
+            !eng9.queue.take_wake(),
+            "R21-P2-11: persistent gone save failure inside sync() must NOT re-wake and defeat polling backoff"
+        );
+        // Simulate `AppState` persisting `deleted_attachments` while `HistoryEntry.gone` stayed
+        // `false`, followed by vault reload wiping in-memory `pending_gone` (`R21-P2-10`):
+        {
+            let mut guard = eng9.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.vault.fail_save.set(false);
+            inner.save_state().await.unwrap();
+            assert!(!inner.vault.entry(&peer9, out_idx9).await.unwrap().unwrap().gone);
+            let mut reloaded = reload(std::mem::take(&mut inner.vault));
+            // Empty in-memory `pending_gone_ids` (as after page reload)!
+            let outcome = reloaded
+                .requeue_excluding_gone(
+                    &peer9,
+                    true,
+                    &BTreeMap::new(),
+                    &std::collections::HashSet::new(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !outcome.outbox.iter().any(|(_, _, rec)| rec.is_some())
+                    && !reloaded
+                        .contact(&peer9)
+                        .unwrap()
+                        .state
+                        .outbox
+                        .iter()
+                        .any(|o| o.history_index == out_idx9),
+                "R21-P2-10: durable deleted_attachments must still exclude deleted pointer from unread requeue after reload"
+            );
+        }
+    });
+}

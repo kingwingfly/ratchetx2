@@ -908,14 +908,22 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return false;
         }
-        // R20-P2-8: Retry any `HistoryEntry.gone = true` saves that failed transiently after
-        // confirmed server deletion so reload + unread requeue never resurrects a deleted pointer.
+        // R20-P2-8 + R21-P2-11: Retry any `HistoryEntry.gone = true` saves that failed transiently
+        // after confirmed server deletion so reload + unread requeue never resurrects a deleted
+        // pointer, without calling `self.wake()` on persistent write errors so normal polling
+        // backoff still applies.
         for (gone_peer, gone_conv_gen, gone_id) in self.uploads.pending_gone() {
             if !self.is_live(vgen) {
                 return false;
             }
             if let Err(e) = self
-                .note_gone_by_id_for_gen(&gone_peer, None, &gone_id, Some(gone_conv_gen))
+                .note_gone_by_id_for_gen_with_wake(
+                    &gone_peer,
+                    None,
+                    &gone_id,
+                    Some(gone_conv_gen),
+                    false,
+                )
                 .await
             {
                 failure.get_or_insert(e);
@@ -1301,25 +1309,51 @@ impl<V: VaultStore> Engine<V> {
         let before_alert = contact.state.security_alert;
         let before_prompt = contact.state.classical_approval_needed;
         if probe.pq_enabled {
+            // R21-P2-5: An approved `ServerPqDisabled` classical fallback deliberately leaves a
+            // PQ-capable peer unpinned with `allow_classical_exception = true` (`pq.rs:1134`).
+            // Probing the peer's signed PQ-ON manifest must still pin `(seq, digest)` monotonically
+            // against rollback/equivocation without revoking that approved server-disabled
+            // fallback.
+            let was_server_pq_disabled_fallback = !before_pq.pq_pinned
+                && before_pq.peer_pq_capable
+                && before_pq.allow_classical_exception
+                && contact.is_classical_session();
             let ppq = contact.session.peer_pq_state_mut();
             if ppq
                 .check_and_pin_manifest(probe.manifest_seq, probe.manifest_digest)
                 .is_ok()
             {
-                ppq.pq_pinned = true;
                 ppq.peer_pq_capable = true;
-                ppq.clear_classical_exception();
-                contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                if !was_server_pq_disabled_fallback {
+                    ppq.pq_pinned = true;
+                    ppq.clear_classical_exception();
+                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                }
             } else {
                 contact.record_policy_error(ErrorKind::DowngradeDetected);
             }
-        } else if contact
-            .session
-            .peer_pq_state_mut()
-            .commit_signed_pq_off_manifest(probe.manifest_seq, probe.manifest_digest)
-            .is_err()
+        } else if !contact.state.quarantined
+            && !contact.session.peer_pq_state().downgrade_detected
+            && contact.state.security_alert != SECURITY_ALERT_DOWNGRADE
         {
-            contact.record_policy_error(ErrorKind::DowngradeDetected);
+            // R21-P2-2: Never clear `peer_pq_capable` via signed PQ-OFF while quarantined or under
+            // an active downgrade alarm (matching `settings.rs` and `outbox.rs`).
+            if contact
+                .session
+                .peer_pq_state_mut()
+                .commit_signed_pq_off_manifest(probe.manifest_seq, probe.manifest_digest)
+                .is_err()
+            {
+                contact.record_policy_error(ErrorKind::DowngradeDetected);
+            }
+        } else {
+            let mut probe_check = contact.session.peer_pq_state().clone();
+            if probe_check
+                .check_and_pin_manifest(probe.manifest_seq, probe.manifest_digest)
+                .is_err()
+            {
+                contact.record_policy_error(ErrorKind::DowngradeDetected);
+            }
         }
         let changed = *contact.session.peer_pq_state() != before_pq
             || contact.state.security_alert != before_alert

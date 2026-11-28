@@ -326,8 +326,6 @@ pub fn expected_audience_from_url(url_or_host: &str) -> Result<String> {
 }
 
 mod v2 {
-    use core::mem;
-
     use bytes::Bytes;
     use party::{EncryptedMessage, Party};
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
@@ -1010,7 +1008,7 @@ mod v2 {
                         if strict_pq {
                             return Err(Error::from_protocol_with_kind(ErrorKind::PqRequired, e));
                         }
-                        if peer_state.pq_pinned {
+                        if peer_state.pq_pinned || peer_state.downgrade_detected {
                             return Err(ErrorKind::DowngradeDetected.into());
                         }
                         if !peer_state.allow_classical_exception {
@@ -2013,8 +2011,8 @@ mod v2 {
 
         /// Synchronous Phase 2 of rekeying (`start_again`): complete `claimed` against
         /// `session`'s live [`PeerPqState`] and merge the new session into `session` via
-        /// [`Session::keep`], returning [`SendInitialV2Request`] to transmit AFTER persisting
-        /// `session.state()`.
+        /// [`Session::accept_replacement_with_policy`] using `self.state.pq_config`, returning
+        /// [`SendInitialV2Request`] to transmit AFTER persisting `session.state()`.
         pub fn finish_prepare_start_again_v2<M: Clone>(
             &self,
             claimed: ClaimedPeerBundle,
@@ -2028,8 +2026,9 @@ mod v2 {
             let mailbox = session.mailbox.clone();
             let prepared =
                 self.finish_prepare_initiate_v2(claimed, &peer_state, content, mailbox)?;
-            let older = mem::replace(session, prepared.session);
-            session.keep(older)?;
+            let local_pq_enabled = self.state.pq_config.pq_enabled
+                && !self.state.pq_config.offered_suites().is_empty();
+            session.accept_replacement_with_policy(prepared.session, local_pq_enabled)?;
             Ok(prepared.request)
         }
 
@@ -2796,10 +2795,13 @@ mod v2 {
                 let digest = manifest_digest(manifest)
                     .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
                 let mut candidate = peer_state.clone();
-                // R19-P2-1 + R20-P1-1: Commit the verified capability transition atomically with
-                // the manifest sequence and digest (rejecting pre-manifest PQ pins and rolled-back
-                // PQ-OFF manifests via `commit_signed_pq_off_manifest`).
+                // R19-P2-1 + R20-P1-1 + R21-P2-2: Commit the verified capability transition
+                // atomically with the manifest sequence and digest (rejecting rolled-back PQ-OFF
+                // manifests and refusing to clear `peer_pq_capable` under a live downgrade alarm).
                 if !manifest.pq_enabled {
+                    if peer_state.downgrade_detected && peer_state.peer_pq_capable {
+                        return Err(ErrorKind::DowngradeDetected.into());
+                    }
                     candidate.commit_signed_pq_off_manifest(manifest.manifest_seq, digest)?;
                 } else {
                     candidate.check_and_pin_manifest(manifest.manifest_seq, digest)?;

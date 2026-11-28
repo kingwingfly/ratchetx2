@@ -1338,6 +1338,11 @@ pub struct ContactState {
     /// proving the server retained a live row or ACK tombstone so no further probes are needed.
     #[prost(bool, tag = "37")]
     pub greeting_delivery_verified: bool,
+    /// Bounded, deduplicated list of 16-byte attachment IDs confirmed deleted or missing on the
+    /// server (`R21-P2-10`, `R21-P3-3`), ensuring unread requeue after reload never resends a dead
+    /// pointer and delayed incoming echoes of already-deleted attachments arrive marked `gone`.
+    #[prost(bytes = "vec", repeated, tag = "38")]
+    pub deleted_attachments: Vec<Vec<u8>>,
 }
 
 /// Persisted structured preview of the most recent message in a chat.

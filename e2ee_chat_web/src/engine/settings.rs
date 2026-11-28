@@ -894,7 +894,9 @@ impl<V: VaultStore> Engine<V> {
             let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
                 return Ok(());
             };
-            if contact.session.active_id() != new_session_id.as_ref() {
+            if contact.state.conversation_gen != expected_conversation_gen
+                || contact.session.active_id() != new_session_id.as_ref()
+            {
                 false
             } else if contact.session.has_pending_active_grant() {
                 if let Some(contact) = inner.contact(&peer)
@@ -929,7 +931,10 @@ impl<V: VaultStore> Engine<V> {
             .message
             .as_ref()
             .is_some_and(|m| m.version >= 2);
-        let send_res: session::Result<()> = Fetch::client(&server)
+        let signs_in_here = super::same_server(&server, &super::origin());
+        // R21-P2-12: Suppress global `REFUSED` sign-in hook so a late 403 for a superseded or
+        // deleted chat cannot open `Dialog::SignIn` before validating `matches_session`.
+        let send_res: session::Result<()> = Fetch::client_without_refused_hook(&server)
             .send_initial_v2(outgoing_req)
             .await
             .map(|_| ())
@@ -949,7 +954,10 @@ impl<V: VaultStore> Engine<V> {
             .contacts
             .iter()
             .find(|c| c.peer == peer)
-            .is_some_and(|c| c.session.active_id() == new_session_id.as_ref());
+            .is_some_and(|c| {
+                c.state.conversation_gen == expected_conversation_gen
+                    && c.session.active_id() == new_session_id.as_ref()
+            });
         match send_res {
             Ok(()) if matches_session => {
                 if inner
@@ -963,8 +971,8 @@ impl<V: VaultStore> Engine<V> {
                 }
             }
             Ok(()) => {}
-            Err(e) => {
-                if e.is_server_refusal() && matches_session {
+            Err(e) if matches_session => {
+                if e.is_server_refusal() {
                     let reverted = inner.contact(&peer).is_some_and(|contact| {
                         if contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
                             contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
@@ -981,13 +989,19 @@ impl<V: VaultStore> Engine<V> {
                         }
                     }
                 }
-                self.check_send_initial_protocol_error(inner, outgoing_is_pq, &e);
+                if e.kind() == ErrorKind::SignInRequired && signs_in_here {
+                    self.queue.mark_waits_sign_in(peer);
+                    self.ask_sign_in();
+                } else {
+                    self.check_send_initial_protocol_error(inner, outgoing_is_pq, &e);
+                }
                 self.ui.log(format!(
                     "upgraded session with {} saved locally; initial message will retry automatically: {}",
                     short(&peer),
                     describe(&e)
                 ));
             }
+            Err(_) => {}
         }
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -1055,68 +1069,93 @@ impl<V: VaultStore> Engine<V> {
             }
         }
         let mut effective_kind = kind;
-        if persist_alert && let Some(contact) = inner.contact(peer) {
-            match kind {
-                ErrorKind::DowngradeDetected => {
-                    // R19-P1-2: Route through `record_policy_error` so pre-downgrade classical
-                    // exceptions and stale prompts are cleared atomically with the downgrade flag.
-                    contact.record_policy_error(ErrorKind::DowngradeDetected);
-                }
-                ErrorKind::PeerManifestExpired => {
-                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                    contact.state.security_alert = SECURITY_ALERT_MANIFEST_EXPIRED;
-                }
-                ErrorKind::PqRequired => {
-                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                    contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
-                }
-                ErrorKind::ClassicalApprovalRequired => {
-                    let server_disabled = e.is_server_pq_disabled_approval();
-                    if matches!(
-                        contact.state.security_alert,
-                        SECURITY_ALERT_PQ_REQUIRED | SECURITY_ALERT_MANIFEST_EXPIRED
-                    ) {
-                        contact.state.security_alert = SECURITY_ALERT_NONE;
+        let mut need_save = false;
+        if let Some(contact) = inner.contact(peer) {
+            if persist_alert {
+                need_save = true;
+                match kind {
+                    ErrorKind::DowngradeDetected => {
+                        // R19-P1-2: Route through `record_policy_error` so pre-downgrade classical
+                        // exceptions and stale prompts are cleared atomically with the downgrade
+                        // flag.
+                        contact.record_policy_error(ErrorKind::DowngradeDetected);
                     }
-                    // R19-P1-1 + R20-P1-1 + R20-P1-4: Persist the peer's verified newer signed
-                    // PQ-OFF manifest pin via `commit_signed_pq_off_manifest` (enforcing both
-                    // pre-manifest PQ pins and monotonic rollback rejection) so legitimate signed
-                    // PQ-OFF peers reach `"Allow classical"`, while rolled-back/pre-manifest pins
-                    // fail closed as `DowngradeDetected`.
-                    let mut downgraded = false;
-                    if !server_disabled
-                        && !contact.state.quarantined
-                        && !contact.session.peer_pq_state().downgrade_detected
-                        && contact.state.security_alert != SECURITY_ALERT_DOWNGRADE
-                        && let Some((seq, digest)) = e.signed_pq_off_manifest()
-                    {
-                        let ppq = contact.session.peer_pq_state_mut();
-                        if ppq.commit_signed_pq_off_manifest(seq, digest).is_ok() {
-                            ppq.clear_classical_exception();
-                        } else {
-                            contact.record_policy_error(ErrorKind::DowngradeDetected);
-                            effective_kind = ErrorKind::DowngradeDetected;
-                            downgraded = true;
+                    ErrorKind::PeerManifestExpired => {
+                        contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                        contact.state.security_alert = SECURITY_ALERT_MANIFEST_EXPIRED;
+                    }
+                    ErrorKind::PqRequired => {
+                        contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                        contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                    }
+                    ErrorKind::ClassicalApprovalRequired => {
+                        let server_disabled = e.is_server_pq_disabled_approval();
+                        if matches!(
+                            contact.state.security_alert,
+                            SECURITY_ALERT_PQ_REQUIRED | SECURITY_ALERT_MANIFEST_EXPIRED
+                        ) {
+                            contact.state.security_alert = SECURITY_ALERT_NONE;
+                        }
+                        // R19-P1-1 + R20-P1-1 + R20-P1-4: Persist the peer's verified newer signed
+                        // PQ-OFF manifest pin via `commit_signed_pq_off_manifest` (enforcing
+                        // monotonic rollback rejection) so legitimate signed PQ-OFF peers reach
+                        // `"Allow classical"`, while rollbacks fail closed as `DowngradeDetected`.
+                        let mut downgraded = false;
+                        if !server_disabled
+                            && !contact.state.quarantined
+                            && !contact.session.peer_pq_state().downgrade_detected
+                            && contact.state.security_alert != SECURITY_ALERT_DOWNGRADE
+                            && let Some((seq, digest)) = e.signed_pq_off_manifest()
+                        {
+                            let ppq = contact.session.peer_pq_state_mut();
+                            if ppq.commit_signed_pq_off_manifest(seq, digest).is_ok() {
+                                ppq.clear_classical_exception();
+                            } else {
+                                contact.record_policy_error(ErrorKind::DowngradeDetected);
+                                effective_kind = ErrorKind::DowngradeDetected;
+                                downgraded = true;
+                            }
+                        }
+                        if !downgraded && !contact.state.quarantined {
+                            contact.state.classical_approval_needed = if server_disabled {
+                                CLASSICAL_APPROVAL_SERVER_PQ_DISABLED
+                            } else {
+                                CLASSICAL_APPROVAL_SIGNED_OFF
+                            };
                         }
                     }
-                    if !downgraded && !contact.state.quarantined {
-                        contact.state.classical_approval_needed = if server_disabled {
-                            CLASSICAL_APPROVAL_SERVER_PQ_DISABLED
-                        } else {
-                            CLASSICAL_APPROVAL_SIGNED_OFF
-                        };
-                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            if let Err(save_err) = inner.save_state().await
-                && self.is_live(vgen)
+            } else if kind == ErrorKind::ClassicalApprovalRequired
+                && !e.is_server_pq_disabled_approval()
+                && !contact.state.quarantined
+                && !contact.session.peer_pq_state().downgrade_detected
+                && contact.state.security_alert != SECURITY_ALERT_DOWNGRADE
+                && let Some((seq, digest)) = e.signed_pq_off_manifest()
             {
-                self.ui.log(format!(
-                    "failed to save security alert (will retry): {}",
-                    describe(&save_err)
-                ));
+                // R21-P2-4: Even on an established peer-confirmed classical chat where
+                // `!persist_alert`, commit any strictly newer verified signed PQ-OFF manifest
+                // monotonically (preserving existing classical consent on the established chat) so
+                // a subsequent upgrade attempt can never accept a rolled-back older manifest.
+                let before_pq = contact.session.peer_pq_state().clone();
+                let ppq = contact.session.peer_pq_state_mut();
+                if ppq.commit_signed_pq_off_manifest(seq, digest).is_ok() {
+                    need_save = *ppq != before_pq;
+                } else {
+                    contact.record_policy_error(ErrorKind::DowngradeDetected);
+                    effective_kind = ErrorKind::DowngradeDetected;
+                    need_save = true;
+                }
             }
+        }
+        if need_save
+            && let Err(save_err) = inner.save_state().await
+            && self.is_live(vgen)
+        {
+            self.ui.log(format!(
+                "failed to save security alert (will retry): {}",
+                describe(&save_err)
+            ));
         }
         if self.is_live(vgen) {
             self.refresh_contacts(inner);

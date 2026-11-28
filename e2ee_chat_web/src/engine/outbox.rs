@@ -1849,7 +1849,10 @@ impl<V: VaultStore> Engine<V> {
                                     }
                                     let retry_res = if should_send_initial {
                                         Some(
-                                            Fetch::client(&server)
+                                            // R21-P2-12: Suppress global `REFUSED` sign-in hook so
+                                            // a late 403 for a superseded/deleted chat never opens
+                                            // `Dialog::SignIn` before validating `still_matches`.
+                                            Fetch::client_without_refused_hook(&server)
                                                 .send_initial_v2(retry_req)
                                                 .await
                                                 .map(|_| ())
@@ -2414,7 +2417,7 @@ impl<V: VaultStore> Engine<V> {
         const MAX_CONFIG_RETRIES: usize = 2;
         let mut attempt = 0usize;
 
-        let (server, new_session_id, outgoing_req) = loop {
+        let (server, expected_conversation_gen, new_session_id, outgoing_req) = loop {
             if !self.is_live(vgen) {
                 return Ok(RekeyOutcome::Aborted);
             }
@@ -2599,7 +2602,12 @@ impl<V: VaultStore> Engine<V> {
             requeued.log_missing(&self.ui, peer);
             self.show_changes(inner, peer, &requeued.history);
             self.refresh_contacts(inner);
-            break (server, new_session_id, outgoing_req);
+            break (
+                server,
+                expected_conversation_gen,
+                new_session_id,
+                outgoing_req,
+            );
         };
 
         // Phase 3 outside `self.inner`: register our new inbound write token BEFORE sending the
@@ -2632,6 +2640,9 @@ impl<V: VaultStore> Engine<V> {
             let Some(contact) = inner.contacts.iter().find(|c| c.peer == *peer) else {
                 return Ok(RekeyOutcome::ContactGone);
             };
+            if contact.state.conversation_gen != expected_conversation_gen {
+                return Ok(RekeyOutcome::ContactGone);
+            }
             if contact.session.active_id() != new_session_id.as_ref() {
                 return Ok(RekeyOutcome::Ready);
             }
@@ -2670,7 +2681,11 @@ impl<V: VaultStore> Engine<V> {
             }
         }
 
-        let send_res: session::Result<()> = Fetch::client(&server)
+        let signs_in_here = same_server(&server, &origin());
+        // R21-P2-12: Suppress global `REFUSED` sign-in hook so a late 403 for a superseded or
+        // deleted chat cannot open `Dialog::SignIn` or back off a recreated chat before validating
+        // `matches_session`.
+        let send_res: session::Result<()> = Fetch::client_without_refused_hook(&server)
             .send_initial_v2(outgoing_req)
             .await
             .map(|_| ())
@@ -2679,8 +2694,9 @@ impl<V: VaultStore> Engine<V> {
             return Ok(RekeyOutcome::Aborted);
         }
 
-        // Phase 4: Re-acquire `self.inner`, validate `is_live(vgen)`, contact existence, and
-        // matching `active_id` before updating `greeting_delivery`.
+        // Phase 4: Re-acquire `self.inner`, validate `is_live(vgen)`, contact existence, exact
+        // `conversation_gen`, and matching `active_id` before updating `greeting_delivery` or
+        // refusal/backoff state.
         let mut guard = self.lock_inner().await;
         if !self.is_live(vgen) {
             return Ok(RekeyOutcome::Aborted);
@@ -2688,14 +2704,13 @@ impl<V: VaultStore> Engine<V> {
         let Some(inner) = guard.as_mut() else {
             return Ok(RekeyOutcome::Aborted);
         };
-        if inner.contact(peer).is_none() {
+        let Some(contact_cur) = inner.contacts.iter().find(|c| c.peer == *peer) else {
+            return Ok(RekeyOutcome::ContactGone);
+        };
+        if contact_cur.state.conversation_gen != expected_conversation_gen {
             return Ok(RekeyOutcome::ContactGone);
         }
-        let matches_session = inner
-            .contacts
-            .iter()
-            .find(|c| c.peer == *peer)
-            .is_some_and(|c| c.session.active_id() == new_session_id.as_ref());
+        let matches_session = contact_cur.session.active_id() == new_session_id.as_ref();
         match send_res {
             Ok(()) => {
                 if matches_session
@@ -2709,8 +2724,8 @@ impl<V: VaultStore> Engine<V> {
                     }
                 }
             }
-            Err(e) => {
-                if e.is_server_refusal() && matches_session {
+            Err(e) if matches_session => {
+                if e.is_server_refusal() {
                     // Only revert `UNCERTAIN -> UNSENT`; never downgrade a greeting already
                     // confirmed concurrently on this session.
                     let reverted = inner.contact(peer).is_some_and(|contact| {
@@ -2729,6 +2744,12 @@ impl<V: VaultStore> Engine<V> {
                         }
                     }
                 }
+                if e.kind() == ErrorKind::SignInRequired && signs_in_here {
+                    self.queue.mark_waits_sign_in(*peer);
+                    self.ask_sign_in();
+                    self.refresh_contacts(inner);
+                    return Ok(RekeyOutcome::Paused);
+                }
                 if self.check_send_initial_protocol_error(inner, outgoing_is_pq, &e) {
                     return Ok(RekeyOutcome::UpdateRequired(describe(&e)));
                 }
@@ -2738,6 +2759,7 @@ impl<V: VaultStore> Engine<V> {
                     return Ok(RekeyOutcome::Paused);
                 }
             }
+            Err(_) => {}
         }
         Ok(RekeyOutcome::Ready)
     }
@@ -3546,8 +3568,16 @@ impl<V: VaultStore> Inner<V> {
             BTreeSet::new()
         };
         let all_sealed = contact.state.needs_requeue_sealed || contact.session.needs_new_session();
+        // R21-P2-10: Also exclude attachment IDs durably recorded in `deleted_attachments` so
+        // reload after a transient `HistoryEntry.gone` save failure never resends a dead pointer.
+        let mut effective_gone = pending_gone_ids.clone();
+        for raw_id in &contact.state.deleted_attachments {
+            if let Ok(id) = <[u8; 16]>::try_from(raw_id.as_slice()) {
+                effective_gone.insert(id);
+            }
+        }
         let outcome = self
-            .rebuild_outbox(peer, again, all_sealed, entries, pending_gone_ids)
+            .rebuild_outbox(peer, again, all_sealed, entries, &effective_gone)
             .await?;
         if deleted {
             let contact = self.contact(peer).ok_or("no such chat")?;

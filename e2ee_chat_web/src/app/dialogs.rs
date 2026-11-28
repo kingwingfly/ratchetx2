@@ -223,8 +223,8 @@ fn apply_start_chat_error(
         }
         StartChatError::DowngradeDetected => {
             progress.try_fail(
-                "Downgrade detected: this invitation pinned post-quantum encryption, but \
-                 the server did not provide valid PQ prekeys.",
+                "Downgrade detected: post-quantum verification failed (missing valid PQ prekeys, \
+                 conflicting classical session, or manifest rollback/equivocation).",
             );
         }
         StartChatError::PeerManifestExpired => {
