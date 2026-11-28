@@ -274,6 +274,7 @@ impl<V: VaultStore> Engine<V> {
                     {
                         Ok((jobs, _)) => {
                             self.uploads.remove_pending_cancel(peer, &cancel_id);
+                            self.reconcile_waiting_upload_flags(inner);
                             server_deletes.extend(jobs);
                             changed = true;
                         }
@@ -2596,6 +2597,7 @@ impl<V: VaultStore> Engine<V> {
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|u| u.id != att_id));
+        self.reconcile_waiting_upload_flags(inner);
         if let Some(key) = del_key {
             server_deletes.push(ServerDeleteJob::for_completed(
                 inner.server.clone(),

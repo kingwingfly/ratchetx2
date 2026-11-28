@@ -3632,6 +3632,7 @@ impl<V: VaultStore> Engine<V> {
         // explicit interactive deletion retries queued farewells after cross-tab sign-in.
         self.queue.clear_peer_sign_in_wait(&peer);
         self.startup.set_farewells_wait_sign_in(false);
+        self.reconcile_waiting_upload_flags(inner);
         self.wake();
         // Only invalidate a queued open targeting the deleted peer; preserve queued navigation to
         // a different peer started while the vault deletion was committing.

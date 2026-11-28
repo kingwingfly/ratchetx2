@@ -36540,3 +36540,350 @@ fn r29_round29_web_engine_regressions() {
         );
     });
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r30_round30_web_engine_regressions() {
+    use super::WAITS_SIGN_IN;
+    use crate::state::UploadState;
+    use leptos::prelude::WithUntracked;
+    use sha2::Digest as _;
+    use std::sync::Arc;
+
+    let _guard = crate::transport::mock_fetch(|_s, _p, _b| Ok((200, vec![])));
+    let mut pool = futures::executor::LocalPool::new();
+    let sign_in_403 = || {
+        Ok((
+            403,
+            br#"{"code":"permission_denied","message":"sign in required"}"#.to_vec(),
+        ))
+    };
+
+    // Part 1 (R30-P2-1):
+    // Evict stale/changed/unreadable cached `ChunkSource` from `UploadRegistry.files` so clicking
+    // Resume opens `<input type="file">` instead of looping on the broken handle across:
+    // (1a) `start_waiting_with_mode` size mismatch,
+    // (1b) `resume_upload_source` `self.check` hash mismatch,
+    // (1c) `upload_chunks` `raw.len() != expected_len` mismatch.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let cgen = {
+            let guard = eng.inner.lock().await;
+            guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .unwrap()
+                .state
+                .conversation_gen
+        };
+
+        // 1a: `start_waiting` with cached file whose size changed on disk.
+        let src_wait = super::attachments::ChunkSource::Bytes {
+            name: "changed_wait.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x10u8; 64]),
+        };
+        eng.wait_for_sign_in(peer, cgen, src_wait).await.unwrap();
+        let wait_id = eng.ui.uploads.with_untracked(|u| u.first().unwrap().id);
+        assert!(eng.has_file(&peer, &wait_id));
+        let mutated_src = super::attachments::ChunkSource::Bytes {
+            name: "changed_wait.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x10u8; 32]),
+        };
+        assert!(eng.start_waiting(peer, wait_id, mutated_src).await.is_err());
+        assert!(
+            !eng.has_file(&peer, &wait_id),
+            "R30-P2-1 (1a): start_waiting size mismatch must evict stale cached ChunkSource"
+        );
+
+        // 1b: `resume_upload_source` `self.check` hash mismatch on cached file.
+        let id_check = [0xc1u8; 16];
+        let key_check = [0xc2u8; 32];
+        let orig_bytes = vec![0x44u8; session::attachment::CHUNK_SIZE + 16];
+        let mut p_check = crate::vault::PendingUpload::default();
+        p_check.id = id_check.to_vec();
+        p_check.token = [0xc3u8; 16].to_vec();
+        p_check.key = key_check.to_vec();
+        p_check.name = "changed_check.bin".into();
+        p_check.size = orig_bytes.len() as u64;
+        p_check.uploaded = 1;
+        p_check.encrypted = 1;
+        p_check.prefix_hash =
+            sha2::Sha256::digest(&orig_bytes[..session::attachment::CHUNK_SIZE]).to_vec();
+        p_check.announced = true;
+        p_check.history_index = 1;
+        p_check.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.vault.save_upload(&peer, &p_check).await.unwrap();
+        }
+        let tampered_same_size = vec![0x99u8; orig_bytes.len()];
+        let cache_key_check = (peer, id_check, super::attachment_key_hash(&key_check));
+        eng.uploads.insert_file(
+            cache_key_check,
+            super::attachments::ChunkSource::Bytes {
+                name: "changed_check.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: Arc::new(tampered_same_size),
+            },
+        );
+        assert!(eng.has_file(&peer, &id_check));
+        assert!(
+            eng.resume_upload_source(peer, id_check, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            !eng.has_file(&peer, &id_check),
+            "R30-P2-1 (1b): resume_upload_source check failure must evict stale cached ChunkSource"
+        );
+
+        // 1c: `upload_chunks` `raw.len() != expected_len` evicts cached file.
+        let id_chunk = [0xd1u8; 16];
+        let key_chunk = [0xd2u8; 32];
+        let mut p_chunk = crate::vault::PendingUpload::default();
+        p_chunk.id = id_chunk.to_vec();
+        p_chunk.token = [0xd3u8; 16].to_vec();
+        p_chunk.key = key_chunk.to_vec();
+        p_chunk.name = "truncated_chunk.bin".into();
+        p_chunk.size = 64;
+        p_chunk.uploaded = 0;
+        p_chunk.encrypted = 0;
+        p_chunk.prefix_hash = sha2::Sha256::digest([]).to_vec();
+        p_chunk.announced = true;
+        p_chunk.history_index = 2;
+        p_chunk.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+        let upload_chunk = super::attachments::upload_of(&p_chunk).unwrap();
+        let short_src = super::attachments::ChunkSource::Bytes {
+            name: "truncated_chunk.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x55u8; 10]),
+        };
+        eng.uploads.insert_file(
+            (peer, id_chunk, super::attachment_key_hash(&key_chunk)),
+            short_src.clone(),
+        );
+        assert!(eng.has_file(&peer, &id_chunk));
+        assert!(
+            eng.upload_chunks(
+                &peer,
+                &mut p_chunk,
+                &upload_chunk,
+                &short_src,
+                sha2::Sha256::new(),
+                std::collections::HashMap::new(),
+                false,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            !eng.has_file(&peer, &id_chunk),
+            "R30-P2-1 (1c): upload_chunks length mismatch must evict stale cached ChunkSource"
+        );
+    });
+
+    // Part 2 (R30-P3-1):
+    // `start_waiting_uploads()` returns `false` on `403 SignInRequired` AND breaks out of the
+    // loop once `waiting_uploads_wait_sign_in` is re-latched so later post-reload waiting uploads
+    // keep `"choose the file again, then sign in to the server"`.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let id_mem = [0x01u8; 16];
+        let id_reloaded = [0xffu8; 16];
+        let src_mem = super::attachments::ChunkSource::Bytes {
+            name: "first_mem.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x22u8; 32]),
+        };
+        let (p_mem, p_reloaded) = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let make_waiting = |id: [u8; 16], name: &str, hist_idx: u64| {
+                let mut p = crate::vault::PendingUpload::default();
+                p.id = id.to_vec();
+                p.name = name.into();
+                p.mime = "application/octet-stream".into();
+                p.size = 32;
+                p.history_index = hist_idx;
+                p.upload_state = crate::vault::UPLOAD_STATE_WAITING;
+                p
+            };
+            let h1 = inner.contact(&peer).unwrap().state.history_len;
+            let p1 = make_waiting(id_mem, "first_mem.bin", h1);
+            let ptr1 = protocol::content::AttachmentPointer {
+                id: vec![],
+                key: vec![],
+                size: p1.size,
+                name: p1.name.clone(),
+                mime: p1.mime.clone(),
+                expires: 0,
+            };
+            inner.add_waiting_upload(&peer, ptr1, &p1).await.unwrap();
+            let h2 = inner.contact(&peer).unwrap().state.history_len;
+            let p2 = make_waiting(id_reloaded, "second_reloaded.bin", h2);
+            let ptr2 = protocol::content::AttachmentPointer {
+                id: vec![],
+                key: vec![],
+                size: p2.size,
+                name: p2.name.clone(),
+                mime: p2.mime.clone(),
+                expires: 0,
+            };
+            inner.add_waiting_upload(&peer, ptr2, &p2).await.unwrap();
+            (p1, p2)
+        };
+        eng.uploads.insert_file(
+            (peer, id_mem, super::attachment_key_hash(&[])),
+            src_mem,
+        );
+        eng.show_upload(&peer, &p_mem, UploadState::Paused(WAITS_SIGN_IN.to_string()));
+        eng.show_upload(
+            &peer,
+            &p_reloaded,
+            UploadState::Paused("choose the file again, then sign in to the server".into()),
+        );
+        let started_any = {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/StartUpload") {
+                    return sign_in_403();
+                }
+                Ok((200, vec![]))
+            });
+            eng.start_waiting_uploads().await
+        };
+        assert!(
+            !started_any,
+            "R30-P3-1: start_waiting_uploads must return false when StartUpload hits 403 SignInRequired"
+        );
+        assert!(
+            eng.uploads.waiting_uploads_wait_sign_in(),
+            "R30-P3-1: 403 must re-latch waiting_uploads_wait_sign_in"
+        );
+        let reloaded_card = eng.ui.uploads.with_untracked(|u| {
+            u.iter()
+                .find(|item| item.id == id_reloaded)
+                .map(|item| item.state.clone())
+        });
+        assert_eq!(
+            reloaded_card,
+            Some(UploadState::Paused(
+                "choose the file again, then sign in to the server".into()
+            )),
+            "R30-P3-1: mid-loop 403 must NOT rewrite later post-reload waiting cards to 'choose the file again to upload'"
+        );
+    });
+
+    // Part 3 (R30-P3-2):
+    // Transient `vault.upload` IDB error inside `start_waiting` (interactive) updates the waiting
+    // card away from stale `WAITS_SIGN_IN`, retains `file` in `UploadRegistry`, and arms
+    // `start_waiting_needed`.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let cgen = {
+            let guard = eng.inner.lock().await;
+            guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .unwrap()
+                .state
+                .conversation_gen
+        };
+        let src = super::attachments::ChunkSource::Bytes {
+            name: "idb_err_wait.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x77u8; 32]),
+        };
+        eng.wait_for_sign_in(peer, cgen, src.clone()).await.unwrap();
+        let wait_id = eng
+            .ui
+            .uploads
+            .with_untracked(|u| u.first().unwrap().id);
+        eng.uploads.remove_attachment_files(&peer, &wait_id);
+        {
+            let guard = eng.inner.lock().await;
+            guard.as_ref().unwrap().vault.fail_upload_read.set(true);
+        }
+        assert!(eng.start_waiting(peer, wait_id, src).await.is_err());
+        {
+            let guard = eng.inner.lock().await;
+            guard.as_ref().unwrap().vault.fail_upload_read.set(false);
+        }
+        let card = eng
+            .ui
+            .uploads
+            .with_untracked(|u| u.first().map(|item| item.state.clone()));
+        assert!(
+            matches!(card, Some(UploadState::Paused(ref msg)) if msg != WAITS_SIGN_IN),
+            "R30-P3-2: vault.upload error in start_waiting must update card away from WAITS_SIGN_IN: got {card:?}"
+        );
+        assert!(
+            eng.has_file(&peer, &wait_id),
+            "R30-P3-2: vault.upload error in start_waiting must retain ChunkSource"
+        );
+        assert!(
+            eng.uploads.start_waiting_needed(),
+            "R30-P3-2: vault.upload error in start_waiting must arm start_waiting_needed"
+        );
+    });
+
+    // Part 4 (R30-P3-3):
+    // Cancelling or deleting the last `UPLOAD_STATE_WAITING` upload clears
+    // `waiting_uploads_wait_sign_in` so `has_latched_sign_in_wait()` returns `false`.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let cgen = {
+            let guard = eng.inner.lock().await;
+            guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .unwrap()
+                .state
+                .conversation_gen
+        };
+        let src1 = super::attachments::ChunkSource::Bytes {
+            name: "cancel_last_wait.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x88u8; 16]),
+        };
+        eng.wait_for_sign_in(peer, cgen, src1).await.unwrap();
+        let id1 = eng
+            .ui
+            .uploads
+            .with_untracked(|u| u.first().unwrap().id);
+        assert!(eng.uploads.waiting_uploads_wait_sign_in());
+        eng.cancel_upload(peer, id1).await.unwrap();
+        assert!(
+            !eng.uploads.waiting_uploads_wait_sign_in() && !eng.has_latched_sign_in_wait(),
+            "R30-P3-3: cancelling the last WAITING upload must clear waiting_uploads_wait_sign_in"
+        );
+
+        let src2 = super::attachments::ChunkSource::Bytes {
+            name: "delete_last_wait.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x99u8; 16]),
+        };
+        eng.wait_for_sign_in(peer, cgen, src2).await.unwrap();
+        assert!(eng.uploads.waiting_uploads_wait_sign_in());
+        eng.delete_for_gen(peer, cgen).await.unwrap();
+        assert!(
+            !eng.uploads.waiting_uploads_wait_sign_in() && !eng.has_latched_sign_in_wait(),
+            "R30-P3-3: deleting the chat with the last WAITING upload must clear waiting_uploads_wait_sign_in"
+        );
+    });
+}
