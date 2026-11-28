@@ -33123,6 +33123,7 @@ fn r23_round23_web_engine_regressions() {
                         &file,
                         sha2::Sha256::new(),
                         HashMap::new(),
+                        true,
                     )
                     .await;
             }
@@ -35243,6 +35244,356 @@ fn r26_round26_web_engine_regressions() {
                 .held
                 .with_untracked(|h| h.contains(&(bob_peer, bob_msg_idx))),
             "R26-P3-1: retry_pending_greetings SendInitialV2 403 must record non-awaits_upload outbox head in ui.held"
+        );
+    });
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn r27_round27_web_engine_regressions() {
+    use leptos::prelude::WithUntracked;
+    use prost::Message as _;
+    use sha2::Digest as _;
+    use std::sync::Arc;
+
+    let _guard = crate::transport::mock_fetch(|_s, _p, _b| Ok((200, vec![])));
+    let mut pool = futures::executor::LocalPool::new();
+    let sign_in_403 = || {
+        Ok((
+            403,
+            br#"{"code":"permission_denied","message":"sign in"}"#.to_vec(),
+        ))
+    };
+
+    // Part 1 (R27-P2-1 + R27-P2-2 + R27-P2-3):
+    // - Post-auth `PushV2` `WriteTokenRejected` clears all origin sign-in waits (`waits_for_sign_in`,
+    //   `publish_waits_sign_in`, `farewells_wait_sign_in`) AND releases non-`awaits_upload` `ui.held`
+    //   rows while preserving genuinely `awaits_upload` held rows.
+    // - Transient 503 on `PushV2` after `head.dispatched = true` releases `outgoing.history_index`
+    //   from `ui.held` without falsely clearing `publish_waits_sign_in`.
+    // - Post-auth `ClaimBundle` policy error (`ClassicalApprovalRequired` from a signed PQ-OFF
+    //   manifest) clears all origin sign-in waits and releases non-`awaits_upload` `ui.held` rows.
+    // - `delete_inner` clears `farewells_wait_sign_in`.
+    pool.run_until(async {
+        let (eng, peer, mut peer_client) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+
+        let (text_idx, waiting_idx, cgen) = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let v1 = inner
+                .add(&peer, Kind::Text("held-then-aborted".into()), false)
+                .await
+                .unwrap();
+            let v2 = inner
+                .add(&peer, Kind::Text("awaits-upload-placeholder".into()), true)
+                .await
+                .unwrap();
+            eng.hold(&peer, v1.index);
+            eng.hold(&peer, v2.index);
+            (
+                v1.index,
+                v2.index,
+                inner.contact(&peer).unwrap().state.conversation_gen,
+            )
+        };
+        let other_peer = [0xa1u8; 32];
+        eng.queue.mark_waits_sign_in(peer);
+        eng.queue.mark_waits_sign_in(other_peer);
+        eng.startup.set_publish_waits_sign_in(true);
+        eng.startup.set_farewells_wait_sign_in(true);
+
+        // 1a: `PushV2` returning post-auth `WriteTokenRejected` (Connect `aborted` 409) clears
+        // all origin waits & releases `text_idx`, while retaining `waiting_idx` (`awaits_upload`).
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PushV2") {
+                    return Ok((
+                        409,
+                        br#"{"code":"aborted","message":"write token rejected"}"#.to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            eng.flush(&peer).await.unwrap();
+        }
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer) && !eng.queue.waits_for_sign_in(&other_peer),
+            "R27-P2-2 + R27-P2-3: post-auth PushV2 WriteTokenRejected must clear all origin peer waits"
+        );
+        assert!(
+            !eng.startup.is_publish_paused() && !eng.startup.farewells_wait_sign_in(),
+            "R27-P2-3: post-auth PushV2 WriteTokenRejected must clear publish_waits_sign_in and farewells_wait_sign_in"
+        );
+        assert!(
+            !eng.ui.held.with_untracked(|h| h.contains(&(peer, text_idx))),
+            "R27-P2-1: post-auth PushV2 WriteTokenRejected must release non-awaits_upload head from ui.held"
+        );
+        assert!(
+            eng.ui.held.with_untracked(|h| h.contains(&(peer, waiting_idx))),
+            "R27-P2-1: release_non_waiting_held must preserve awaits_upload placeholders in ui.held"
+        );
+
+        // 1b: Transient 503 on `PushV2` after `head.dispatched = true` releases `ui.held` without
+        // clearing `publish_waits_sign_in` (since 503 did not prove auth).
+        let (eng2, peer2, _) = established_engine_on_localhost().await;
+        eng2.startup.set_can_sign_in_here(true);
+        let idx_503 = {
+            let mut guard = eng2.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let v = inner
+                .add(&peer2, Kind::Text("held-then-503".into()), false)
+                .await
+                .unwrap();
+            eng2.hold(&peer2, v.index);
+            v.index
+        };
+        eng2.startup.set_publish_waits_sign_in(true);
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PushV2") {
+                    return Ok((
+                        503,
+                        br#"{"code":"unavailable","message":"transient"}"#.to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            assert!(eng2.flush(&peer2).await.is_err());
+        }
+        assert!(
+            !eng2.ui.held.with_untracked(|h| h.contains(&(peer2, idx_503))),
+            "R27-P2-1 (Variant B): transient PushV2 503 after dispatched=true must release ui.held"
+        );
+        assert!(
+            eng2.startup.is_publish_paused(),
+            "R27-P2-1: transient 503 must NOT falsely clear publish_waits_sign_in"
+        );
+
+        // 1c: Post-auth `ClaimBundle` returning a verified signed PQ-OFF manifest
+        // (`ClassicalApprovalRequired`) in `upgrade_to_pq_for_gen` clears all origin sign-in waits
+        // and releases non-`awaits_upload` `ui.held` rows!
+        let mut off_cfg = peer_client.pq_config().clone();
+        off_cfg.pq_enabled = false;
+        off_cfg.pq_ratchet_enabled = false;
+        off_cfg.strict_pq = false;
+        peer_client.set_pq_config(off_cfg).unwrap();
+        let off_bundle = publish_bundle_for_test(&mut peer_client, "localhost", 1).remove(0);
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.session.peer_pq_state_mut().pq_pinned = false;
+            c.session.peer_pq_state_mut().peer_pq_capable = false;
+            c.session.peer_pq_state_mut().downgrade_detected = false;
+            c.session.peer_pq_state_mut().pinned_manifest_seq = 0;
+            c.session.peer_pq_state_mut().pinned_manifest_digest = None;
+            eng.hold(&peer, text_idx);
+        }
+        eng.queue.mark_waits_sign_in(peer);
+        eng.startup.set_publish_waits_sign_in(true);
+        eng.startup.set_farewells_wait_sign_in(true);
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/ClaimBundle") {
+                    return Ok((200, off_bundle.encode_to_vec()));
+                }
+                Ok((200, vec![]))
+            });
+            assert!(eng.upgrade_to_pq_for_gen(peer, cgen).await.is_err());
+        }
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer)
+                && !eng.startup.is_publish_paused()
+                && !eng.startup.farewells_wait_sign_in(),
+            "R27-P2-2: post-auth ClaimBundle ClassicalApprovalRequired must clear all origin sign-in waits"
+        );
+        assert!(
+            !eng.ui.held.with_untracked(|h| h.contains(&(peer, text_idx))),
+            "R27-P2-1: post-auth ClaimBundle ClassicalApprovalRequired must release non-awaits_upload ui.held"
+        );
+
+        // 1d: `delete_for_gen` clears `farewells_wait_sign_in`.
+        eng.startup.set_farewells_wait_sign_in(true);
+        eng.delete_for_gen(peer, cgen).await.unwrap();
+        assert!(
+            !eng.startup.farewells_wait_sign_in(),
+            "R27-P2-3: interactive delete_inner must clear farewells_wait_sign_in"
+        );
+    });
+
+    // Part 2 (R27-P2-4):
+    // Interactive `resume_upload_source` (`background = false`) opens `Dialog::SignIn` on
+    // `PutChunk` 403 even after `decline_sign_in_prompts()`, while background `upload_chunks(...,
+    // true)` honors `declined_sign_in`.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        eng.decline_sign_in_prompts();
+
+        let att_id = [0xa2u8; 16];
+        let att_key = [0xa3u8; 32];
+        let two_chunks = (session::attachment::CHUNK_SIZE as u64) + 64;
+        let file_bytes = vec![0x33u8; two_chunks as usize];
+        let prefix_hash =
+            sha2::Sha256::digest(&file_bytes[..session::attachment::CHUNK_SIZE]).to_vec();
+        let mut p = crate::vault::PendingUpload::default();
+        p.id = att_id.to_vec();
+        p.token = [0xa4u8; 16].to_vec();
+        p.key = att_key.to_vec();
+        p.name = "resume_403.bin".into();
+        p.size = two_chunks;
+        p.uploaded = 1;
+        p.encrypted = 1;
+        p.prefix_hash = prefix_hash;
+        p.announced = true;
+        p.history_index = 1;
+        p.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.vault.save_upload(&peer, &p).await.unwrap();
+        }
+        let upload = super::attachments::upload_of(&p).unwrap();
+        let src = super::attachments::ChunkSource::Bytes {
+            name: "resume_403.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(file_bytes.clone()),
+        };
+
+        // Background `upload_chunks(..., true)` hitting PutChunk 403 respects `declined_sign_in`.
+        let bg_put_calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        {
+            let bp = bg_put_calls.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PutChunk") {
+                    bp.set(bp.get() + 1);
+                    return sign_in_403();
+                }
+                Ok((200, vec![]))
+            });
+            let mut p_bg = p.clone();
+            let mut hasher_bg = sha2::Sha256::new();
+            hasher_bg.update(&file_bytes[..session::attachment::CHUNK_SIZE]);
+            assert!(
+                eng.upload_chunks(
+                    &peer,
+                    &mut p_bg,
+                    &upload,
+                    &src,
+                    hasher_bg,
+                    std::collections::HashMap::new(),
+                    true,
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(bg_put_calls.get(), 1);
+        assert_eq!(
+            eng.ui.dialog.get_untracked(),
+            None,
+            "R27-P2-4: background PutChunk 403 must respect declined_sign_in"
+        );
+
+        // Explicit interactive `resume_upload_source` (`background = false`) hitting PutChunk 403
+        // MUST open `Dialog::SignIn` even after prior decline!
+        let fg_put_calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.vault.save_upload(&peer, &p).await.unwrap();
+        }
+        {
+            let fp = fg_put_calls.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PutChunk") {
+                    fp.set(fp.get() + 1);
+                    return sign_in_403();
+                }
+                Ok((200, vec![]))
+            });
+            let src2 = super::attachments::ChunkSource::Bytes {
+                name: "resume_403.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: Arc::new(file_bytes),
+            };
+            assert!(
+                eng.resume_upload_source(peer, att_id, Some(src2))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(fg_put_calls.get(), 1);
+        assert_eq!(
+            eng.ui.dialog.get_untracked(),
+            Some(Dialog::SignIn),
+            "R27-P2-4: explicit interactive resume_upload_source PutChunk 403 must open Dialog::SignIn"
+        );
+    });
+
+    // Part 3 (R27-P3-1 + R27-P3-2):
+    // - `on_origin_auth_proven(stale_vgen)` does NOT leak across vault generations.
+    // - `push_events` hitting 403 records a concurrently promoted non-`awaits_upload` outbox head
+    //   in `ui.held`.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let stale_vgen = eng.vault_gen().wrapping_sub(1);
+        eng.queue.mark_waits_sign_in(peer);
+        eng.startup.set_publish_waits_sign_in(true);
+        eng.startup.set_farewells_wait_sign_in(true);
+        eng.on_origin_auth_proven(stale_vgen);
+        assert!(
+            eng.queue.waits_for_sign_in(&peer)
+                && eng.startup.is_publish_paused()
+                && eng.startup.farewells_wait_sign_in(),
+            "R27-P3-1: stale vault generation must not clear current generation's sign-in waits"
+        );
+        eng.queue.clear_peer_sign_in_wait(&peer);
+
+        // 3b (R27-P3-2): Queue an event so `push_events` runs, and concurrently add a
+        // non-`awaits_upload` outbox item while `PushV2` is suspended -> 403 marks it in `ui.held`!
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.tell_downloaded(1);
+            inner.save_state().await.unwrap();
+        }
+        let promoted_idx: std::rc::Rc<std::cell::Cell<Option<u64>>> =
+            std::rc::Rc::new(std::cell::Cell::new(None));
+        {
+            let eng_c = eng.clone();
+            let pi = promoted_idx.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let eng_c = eng_c.clone();
+                let pi = pi.clone();
+                async move {
+                    if path.ends_with("/PushV2") {
+                        let mut guard = eng_c.inner.lock().await;
+                        let inner = guard.as_mut().unwrap();
+                        let v = inner
+                            .add(&peer, Kind::Text("promoted-mid-events".into()), false)
+                            .await
+                            .unwrap();
+                        pi.set(Some(v.index));
+                        drop(guard);
+                        return sign_in_403();
+                    }
+                    Ok((200, vec![]))
+                }
+            });
+            eng.flush_background(&peer).await.unwrap();
+        }
+        let idx = promoted_idx.get().expect("PushV2 should have run");
+        assert!(
+            eng.ui.held.with_untracked(|h| h.contains(&(peer, idx))),
+            "R27-P3-2: push_events 403 must mark concurrently added non-awaits_upload head in ui.held"
         );
     });
 }

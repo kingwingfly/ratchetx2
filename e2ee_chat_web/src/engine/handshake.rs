@@ -2498,6 +2498,9 @@ impl<V: VaultStore> Engine<V> {
                     &preserve_digests,
                 );
                 self.startup.on_publish_succeeded();
+                if same_server(&inner.server, &origin()) {
+                    self.on_origin_auth_proven_locked(vgen, inner);
+                }
                 let concurrent_classical = inner
                     .state
                     .used_one_time_prekeys
@@ -2578,6 +2581,9 @@ impl<V: VaultStore> Engine<V> {
                 Ok(PublishFullOutcome::Published)
             }
             Ok(PublishV2Outcome::ServerPqDisabled) => {
+                if same_server(&inner.server, &origin()) {
+                    self.on_origin_auth_proven_locked(vgen, inner);
+                }
                 inner.client.rollback_publish_v2_on_refusal(prepared);
                 self.finish_publish_rollback(
                     inner,
@@ -2588,6 +2594,12 @@ impl<V: VaultStore> Engine<V> {
                 .map(|()| PublishFullOutcome::Deferred)
             }
             Err(e) => {
+                if same_server(&inner.server, &origin())
+                    && e.is_server_refusal()
+                    && e.kind() != ErrorKind::SignInRequired
+                {
+                    self.on_origin_auth_proven_locked(vgen, inner);
+                }
                 self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                 let error = PublishError::transmitted(e);
                 if error.definitive_refusal {
@@ -2817,7 +2829,12 @@ impl<V: VaultStore> Engine<V> {
         let sent_classical = !prepared.request.one_time_prekeys.is_empty();
         let sent_pq = !prepared.request.pq_one_time_prekeys.is_empty();
         let response = match refill_res {
-            Ok(response) => response,
+            Ok(response) => {
+                if same_server(&inner.server, &origin()) {
+                    self.on_origin_auth_proven_locked(vgen, inner);
+                }
+                response
+            }
             Err(e) if !e.is_server_refusal() => {
                 // R11-P2-3: Ambiguous transport/timeout/5xx failure may have committed the batch on
                 // the relay; invalidate FIFO queue tracking for every pool included in this batch
@@ -2839,6 +2856,9 @@ impl<V: VaultStore> Engine<V> {
                 return Err(describe(&e));
             }
             Err(e) => {
+                if same_server(&inner.server, &origin()) && e.kind() != ErrorKind::SignInRequired {
+                    self.on_origin_auth_proven_locked(vgen, inner);
+                }
                 inner.client.rollback_refill_v2_on_refusal(prepared);
                 let outcome = match e.kind() {
                     ErrorKind::SignInRequired => {
@@ -4705,16 +4725,24 @@ impl<V: VaultStore> Engine<V> {
         let (claimed, server_url, clock, signs_in_here, claimed_pq_config) = {
             let mut attempt = 0usize;
             loop {
-                let (server_url, audience, pq_config, clock, signs_in_here) = {
+                let (server_url, audience, pq_config, local_pq_enabled, clock, signs_in_here) = {
                     let inner = guard
                         .as_ref()
                         .ok_or_else(|| StartChatError::Other("locked".into()))?;
                     let server_url = inner.server.clone();
                     let audience = inner.audience.clone();
                     let pq_config = inner.client.pq_config().clone();
+                    let local_pq_enabled = inner.local_pq_enabled();
                     let clock = inner.client.clock().clone();
                     let signs_in_here = same_server(&server_url, &origin());
-                    (server_url, audience, pq_config, clock, signs_in_here)
+                    (
+                        server_url,
+                        audience,
+                        pq_config,
+                        local_pq_enabled,
+                        clock,
+                        signs_in_here,
+                    )
                 };
                 drop(guard);
 
@@ -4722,7 +4750,7 @@ impl<V: VaultStore> Engine<V> {
                 // already propagates via `StartChatError::SignInRequired` (gated on `is_live(vgen)`
                 // and `!is_submission_cancelled(submission_id)`) without colliding across
                 // concurrent `start_chat` submissions.
-                let claimed = session::claim_peer_bundle_v2(
+                let claim_res = session::claim_peer_bundle_v2(
                     &Fetch::client_without_refused_hook(&server_url),
                     &audience,
                     &peer,
@@ -4730,18 +4758,30 @@ impl<V: VaultStore> Engine<V> {
                     &pq_config,
                     &clock,
                 )
-                .await
-                .map_err(|e| {
-                    self.map_start_chat_session_error(
-                        vgen,
-                        submission_id,
-                        &peer,
-                        pin_pq,
-                        signs_in_here,
-                        &clock,
-                        e,
-                    )
-                })?;
+                .await;
+                let claimed = match claim_res {
+                    Ok(claimed) => claimed,
+                    Err(e) => {
+                        if signs_in_here
+                            && super::outbox::is_post_auth_claim_error(
+                                &e,
+                                &pq_config,
+                                local_pq_enabled,
+                            )
+                        {
+                            self.on_origin_auth_proven_async(vgen).await;
+                        }
+                        return Err(self.map_start_chat_session_error(
+                            vgen,
+                            submission_id,
+                            &peer,
+                            pin_pq,
+                            signs_in_here,
+                            &clock,
+                            e,
+                        ));
+                    }
+                };
 
                 if !self.is_live(vgen) {
                     return Err(StartChatError::Cancelled);
@@ -4751,13 +4791,13 @@ impl<V: VaultStore> Engine<V> {
                 if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
                     return Err(StartChatError::Cancelled);
                 }
-                if signs_in_here {
-                    self.queue.clear_peer_sign_in_wait(&peer);
-                }
                 {
                     let inner = guard
                         .as_mut()
                         .ok_or_else(|| StartChatError::Other("locked".into()))?;
+                    if signs_in_here {
+                        self.on_origin_auth_proven_locked(vgen, inner);
+                    }
                     inner.check_outgoing_peer(&peer)?;
                     if inner.contacts.iter().any(|c| c.peer == peer) {
                         // Peer arrived via an inbound initial while `ClaimBundle` was suspended:
@@ -5728,6 +5768,15 @@ impl<V: VaultStore> Engine<V> {
                 .find(|c| c.peer == peer)
                 .is_some_and(|c| c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED);
 
+        if signs_in_here
+            && (send_res.is_ok()
+                || send_res
+                    .as_ref()
+                    .is_err_and(|e| e.is_server_refusal() && e.kind() != ErrorKind::SignInRequired))
+        {
+            self.on_origin_auth_proven_locked(vgen, inner);
+        }
+
         match send_res {
             Err(e) => {
                 if !contact_exists {
@@ -5840,9 +5889,6 @@ impl<V: VaultStore> Engine<V> {
                     return Err(StartChatError::Cancelled);
                 }
                 if matches_session {
-                    if signs_in_here {
-                        self.queue.clear_peer_sign_in_wait(&peer);
-                    }
                     if let Some(contact) = inner.contact(&peer) {
                         contact.mark_greeting_confirmed();
                     }

@@ -1164,8 +1164,8 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(());
             }
-            match pushed {
-                Ok(()) => {}
+            let auth_proven = match pushed {
+                Ok(()) => signs_in_here,
                 // Pushing takes a sign-in: they wait for it, without failing the round.
                 Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
                     let still_queued = {
@@ -1200,12 +1200,19 @@ impl<V: VaultStore> Engine<V> {
                         "could not tell a deleted chat's peer of it: {}",
                         describe(&e)
                     ));
+                    signs_in_here && e.kind() != ErrorKind::SignInRequired
                 }
                 Err(e) => {
+                    if signs_in_here
+                        && e.is_server_refusal()
+                        && e.kind() != ErrorKind::SignInRequired
+                    {
+                        self.on_origin_auth_proven_async(vgen).await;
+                    }
                     self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                     return Err(describe(&e));
                 }
-            }
+            };
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Ok(());
@@ -1213,6 +1220,9 @@ impl<V: VaultStore> Engine<V> {
             let Some(inner) = guard.as_mut() else {
                 return Ok(());
             };
+            if auth_proven {
+                self.on_origin_auth_proven_locked(vgen, inner);
+            }
             if let Some(pos) = inner
                 .state
                 .farewells
@@ -1785,6 +1795,14 @@ impl<V: VaultStore> Engine<V> {
                                 && c.session.active_id() == session_id.as_ref()
                                 && !c.session.is_known_by_peer()
                         });
+                if signs_in_here
+                    && (send_res.is_ok()
+                        || send_res.as_ref().is_err_and(|e| {
+                            e.is_server_refusal() && e.kind() != ErrorKind::SignInRequired
+                        }))
+                {
+                    self.on_origin_auth_proven_locked(vgen, inner);
+                }
                 match send_res {
                     Ok(()) if matches_session => {
                         if was_confirmed_probe {

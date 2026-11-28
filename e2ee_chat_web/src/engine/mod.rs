@@ -861,8 +861,11 @@ impl<V: VaultStore> Engine<V> {
     /// Resume held peers, pending prekey publishing, and waiting uploads after observing a valid
     /// server sign-in (either via [`sign_in`](Self::sign_in) or an external sign-in discovered by
     /// [`signed_in`](Self::signed_in)).
-    fn resume_after_sign_in(&self) {
-        self.queue.clear_all_sign_in_waits();
+    async fn resume_after_sign_in(&self, vgen: u64) {
+        self.on_origin_auth_proven_async(vgen).await;
+        if !self.is_live(vgen) {
+            return;
+        }
         self.startup.on_resume_after_sign_in();
         self.wake();
     }
@@ -877,7 +880,10 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
         if signed_in.is_some() {
-            self.resume_after_sign_in();
+            self.resume_after_sign_in(vgen).await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let engine = self.clone();
             spawn_local(async move {
                 engine.start_waiting_uploads().await;
@@ -922,7 +928,10 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        self.resume_after_sign_in();
+        self.resume_after_sign_in(vgen).await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         self.start_waiting_uploads().await;
         if self.is_live(vgen) {
             self.wake();
@@ -3613,8 +3622,10 @@ impl<V: VaultStore> Engine<V> {
         self.ui.held.update(|held| held.retain(|(p, _)| *p != peer));
         self.ui.gone.update(|gone| gone.retain(|(p, _)| *p != peer));
         // Nor does what waited for a sign-in, which would otherwise hold up a chat started
-        // again with the peer, or go to it.
+        // again with the peer, or go to it. Also clear `farewells_wait_sign_in` (`R27-P2-3`) so an
+        // explicit interactive deletion retries queued farewells after cross-tab sign-in.
         self.queue.clear_peer_sign_in_wait(&peer);
+        self.startup.set_farewells_wait_sign_in(false);
         self.wake();
         // Only invalidate a queued open targeting the deleted peer; preserve queued navigation to
         // a different peer started while the vault deletion was committing.

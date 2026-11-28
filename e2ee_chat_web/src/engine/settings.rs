@@ -657,22 +657,28 @@ impl<V: VaultStore> Engine<V> {
             }
             let claimed = match claim_res {
                 Ok(claimed) => {
-                    // R26-P2-1: Clear any stale peer sign-in wait once authenticated `ClaimBundle`
-                    // succeeds so `self.wake()` flushes requeued messages after cross-tab sign-in.
+                    // R26-P2-1 + R27-P2-1 + R27-P2-3: Clear all origin sign-in waits and release
+                    // non-`awaits_upload` `ui.held` rows once authenticated `ClaimBundle` succeeds.
                     if super::same_server(&inner.server, &super::origin()) {
-                        self.queue.clear_peer_sign_in_wait(&peer);
+                        self.on_origin_auth_proven_locked(vgen, inner);
                     }
                     claimed
                 }
                 Err(e) => {
-                    if e.kind() == ErrorKind::SignInRequired
-                        && super::same_server(&inner.server, &super::origin())
-                    {
-                        if require_approved {
-                            self.queue.mark_waits_sign_in(peer);
-                            self.hold_outbox_head_for_sign_in(inner, &peer);
+                    if super::same_server(&inner.server, &super::origin()) {
+                        if e.kind() == ErrorKind::SignInRequired {
+                            if require_approved {
+                                self.queue.mark_waits_sign_in(peer);
+                                self.hold_outbox_head_for_sign_in(inner, &peer);
+                            }
+                            self.ask_sign_in_for(require_approved);
+                        } else if super::outbox::is_post_auth_claim_error(
+                            &e,
+                            &pq_cfg,
+                            inner.local_pq_enabled(),
+                        ) {
+                            self.on_origin_auth_proven_locked(vgen, inner);
                         }
-                        self.ask_sign_in_for(require_approved);
                     }
                     return Err(self.handle_upgrade_pq_error(vgen, inner, &peer, e).await);
                 }
@@ -994,11 +1000,16 @@ impl<V: VaultStore> Engine<V> {
                 c.state.conversation_gen == expected_conversation_gen
                     && c.session.active_id() == new_session_id.as_ref()
             });
+        if signs_in_here
+            && (send_res.is_ok()
+                || send_res
+                    .as_ref()
+                    .is_err_and(|e| e.is_server_refusal() && e.kind() != ErrorKind::SignInRequired))
+        {
+            self.on_origin_auth_proven_locked(vgen, inner);
+        }
         match send_res {
             Ok(()) if matches_session => {
-                if signs_in_here {
-                    self.queue.clear_peer_sign_in_wait(&peer);
-                }
                 if inner
                     .contact(&peer)
                     .is_some_and(Contact::mark_greeting_confirmed)

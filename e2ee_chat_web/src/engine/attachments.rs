@@ -406,7 +406,11 @@ impl<V: VaultStore> Engine<V> {
         let upload = match started {
             Ok(upload) => {
                 if signs_in_here {
-                    self.queue.clear_peer_sign_in_wait(&peer);
+                    self.on_origin_auth_proven_async(vgen).await;
+                    if !self.is_live(vgen) {
+                        let _ = upload.cancel(&Fetch::client(&server)).await;
+                        return Err("locked".into());
+                    }
                 }
                 upload
             }
@@ -427,6 +431,9 @@ impl<V: VaultStore> Engine<V> {
                 ));
             }
             Err(e) => {
+                if signs_in_here && e.is_server_refusal() {
+                    self.on_origin_auth_proven_async(vgen).await;
+                }
                 // Report attachment 404/Unimplemented locally without tripping global update_required.
                 return Err(describe(&e));
             }
@@ -555,7 +562,7 @@ impl<V: VaultStore> Engine<V> {
         #[cfg(target_arch = "wasm32")]
         spawn_local(async move {
             if let Err(e) = engine
-                .run_upload(peer, pending, file, VerifiedResume::fresh())
+                .run_upload(peer, pending, file, VerifiedResume::fresh(), true)
                 .await
                 && engine.is_live(vgen)
             {
@@ -564,7 +571,7 @@ impl<V: VaultStore> Engine<V> {
         });
         #[cfg(not(target_arch = "wasm32"))]
         if let Err(e) = engine
-            .run_upload(peer, pending, file, VerifiedResume::fresh())
+            .run_upload(peer, pending, file, VerifiedResume::fresh(), true)
             .await
             && engine.is_live(vgen)
         {
@@ -824,8 +831,10 @@ impl<V: VaultStore> Engine<V> {
                 .await;
         let upload = match started {
             Ok(upload) => {
+                // R27-P3-1 + R27-P2-3: Guard origin auth clearing strictly on `self.is_live(vgen)`
+                // (enforced inside `on_origin_auth_proven_async`).
                 if same_server(&server, &origin()) {
-                    self.queue.clear_peer_sign_in_wait(&peer);
+                    self.on_origin_auth_proven_async(vgen).await;
                 }
                 upload
             }
@@ -868,6 +877,9 @@ impl<V: VaultStore> Engine<V> {
             Err(e) => {
                 if !self.is_live(vgen) || self.is_cancelled(&waiting) {
                     return Ok(());
+                }
+                if same_server(&server, &origin()) && e.is_server_refusal() {
+                    self.on_origin_auth_proven_async(vgen).await;
                 }
                 // Report attachment 404/Unimplemented locally without tripping global update_required.
                 return Err(describe(&e));
@@ -1127,7 +1139,7 @@ impl<V: VaultStore> Engine<V> {
         #[cfg(target_arch = "wasm32")]
         spawn_local(async move {
             if let Err(e) = engine
-                .run_upload(peer, pending, file, VerifiedResume::fresh())
+                .run_upload(peer, pending, file, VerifiedResume::fresh(), true)
                 .await
                 && engine.is_live(vgen)
             {
@@ -1136,7 +1148,7 @@ impl<V: VaultStore> Engine<V> {
         });
         #[cfg(not(target_arch = "wasm32"))]
         if let Err(e) = engine
-            .run_upload(peer, pending, file, VerifiedResume::fresh())
+            .run_upload(peer, pending, file, VerifiedResume::fresh(), true)
             .await
             && engine.is_live(vgen)
         {
@@ -1485,7 +1497,7 @@ impl<V: VaultStore> Engine<V> {
         {
             self.ui.link.set(Link::Offline(e));
         }
-        let result = self.run_upload(peer, pending, file, resume).await;
+        let result = self.run_upload(peer, pending, file, resume, false).await;
         drop(running_guard);
         result
     }
@@ -2373,6 +2385,7 @@ impl<V: VaultStore> Engine<V> {
         mut pending: PendingUpload,
         file: ChunkSource,
         resume: VerifiedResume,
+        background: bool,
     ) -> Result<(), String> {
         let vgen = self.vault_gen();
         let id: [u8; 16] = pending
@@ -2392,6 +2405,7 @@ impl<V: VaultStore> Engine<V> {
                     &file,
                     resume.hasher,
                     resume.verified_chunks,
+                    background,
                 )
                 .await
             }
@@ -2934,6 +2948,7 @@ impl<V: VaultStore> Engine<V> {
     /// chunk directly from `verified_chunks` and reading newer chunks from `file` in turn, unless
     /// the upload is cancelled. Returns whether the server still has the attachment: one deleted
     /// meanwhile, e.g. by the peer, is not found.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn upload_chunks(
         &self,
         peer: &PublicKey,
@@ -2942,6 +2957,7 @@ impl<V: VaultStore> Engine<V> {
         file: &ChunkSource,
         mut hasher: Sha256,
         mut verified_chunks: HashMap<u32, Zeroizing<Vec<u8>>>,
+        background: bool,
     ) -> Result<bool, String> {
         let vgen = self.vault_gen();
         let lock_gen = crate::glue::lock_generation();
@@ -3025,6 +3041,7 @@ impl<V: VaultStore> Engine<V> {
                     &chunk,
                     expected_conv_gen,
                     signs_in_here,
+                    background,
                 )
                 .await?
             {
@@ -3081,6 +3098,7 @@ impl<V: VaultStore> Engine<V> {
         chunk: &[u8],
         expected_conv_gen: u64,
         signs_in_here: bool,
+        background: bool,
     ) -> Result<bool, String> {
         let vgen = self.vault_gen();
         let mut wait = RETRY_MIN;
@@ -3090,14 +3108,19 @@ impl<V: VaultStore> Engine<V> {
             }
             match upload.put(attachments, index, chunk).await {
                 Ok(()) => {
-                    // R26-P2-1: Authenticated `PutChunk` succeeded; clear any stale peer sign-in
-                    // wait so completion's `self.wake()` flushes any held announcement/outbox.
-                    if signs_in_here && self.is_live(vgen) {
-                        self.queue.clear_peer_sign_in_wait(peer);
+                    // R26-P2-1 + R27-P2-3: Authenticated `PutChunk` succeeded; clear all latched
+                    // origin sign-in waits and release non-`awaits_upload` `ui.held` rows.
+                    if signs_in_here {
+                        self.on_origin_auth_proven_async(vgen).await;
                     }
                     return Ok(true);
                 }
-                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    if signs_in_here && e.is_server_refusal() {
+                        self.on_origin_auth_proven_async(vgen).await;
+                    }
+                    return Ok(false);
+                }
                 Err(e) if e.kind() == ErrorKind::Server => {
                     if !self.is_live(vgen) || self.is_cancelled(upload.id()) {
                         return Ok(true);
@@ -3110,9 +3133,11 @@ impl<V: VaultStore> Engine<V> {
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::SignInRequired => {
-                    // R23-P2-1: Open `Dialog::SignIn` ONLY when the vault is still live, the
-                    // upload is not cancelled, the server matches this origin, and the contact
-                    // still exists at `expected_conv_gen`.
+                    // R23-P2-1 + R27-P2-4: Open `Dialog::SignIn` ONLY when the vault is still live,
+                    // the upload is not cancelled, the server matches this origin, and the contact
+                    // still exists at `expected_conv_gen`; honor `background` so explicit
+                    // interactive "Resume" (`background = false`) re-opens `Dialog::SignIn` even
+                    // after an earlier decline while detached uploads stay background-scoped.
                     if signs_in_here && self.is_live(vgen) && !self.is_cancelled(upload.id()) {
                         let still_active = {
                             let guard = self.lock_inner().await;
@@ -3128,12 +3153,17 @@ impl<V: VaultStore> Engine<V> {
                                 })
                         };
                         if still_active && self.is_live(vgen) && !self.is_cancelled(upload.id()) {
-                            self.ask_sign_in_background();
+                            self.ask_sign_in_for(background);
                         }
                     }
                     return Err(describe(&e));
                 }
-                Err(e) => return Err(describe(&e)),
+                Err(e) => {
+                    if signs_in_here && e.is_server_refusal() {
+                        self.on_origin_auth_proven_async(vgen).await;
+                    }
+                    return Err(describe(&e));
+                }
             }
         }
     }
