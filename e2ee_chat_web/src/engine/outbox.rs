@@ -238,6 +238,32 @@ impl<V: VaultStore> Engine<V> {
                         inner.in_flight_push.remove(peer);
                     }
                 }
+                // R16-P2-9: Retry any transiently failed `cancel_upload` settlement for this peer
+                // before pushing so a temporary IDB error during Cancel never strands the outbox.
+                let mut cancel_retry_err = None;
+                for cancel_id in self.uploads.pending_cancels_for_peer(peer) {
+                    match self
+                        .settle_cancelled_upload_locked(vgen, inner, peer, cancel_id)
+                        .await
+                    {
+                        Ok((jobs, _)) => {
+                            self.uploads.remove_pending_cancel(peer, &cancel_id);
+                            server_deletes.extend(jobs);
+                            changed = true;
+                        }
+                        Err(e) => {
+                            if !self.is_live(vgen) {
+                                return Ok(false);
+                            }
+                            cancel_retry_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = cancel_retry_err {
+                    result = Err(e);
+                    break;
+                }
                 match inner.requeue_before_push(peer).await {
                     Ok(Some(outcome)) => {
                         if !self.is_live(vgen) {
@@ -341,7 +367,57 @@ impl<V: VaultStore> Engine<V> {
                     }
                     // An attachment whose upload has not started: it, and what was sent after it,
                     // wait for it to start.
+                    // R16-P2-5 + R16-P2-7: If its `UPLOAD_STATE_WAITING` checkpoint exists
+                    // (including at `history_index == 0`) and its `PendingUpload` record is
+                    // missing or corrupt (e.g. unlock cleanup failed transiently), fail and
+                    // unblock the head here once storage recovers.
                     if outgoing.awaits_upload {
+                        let waiting_cp = inner
+                            .vault
+                            .tracked_upload_checkpoints(Some(peer))
+                            .into_iter()
+                            .find_map(|cp| {
+                                let id = <[u8; 16]>::try_from(cp.id.as_slice()).ok()?;
+                                (cp.upload_state == crate::vault::UPLOAD_STATE_WAITING
+                                    && super::checkpoint_matches_outbox(&cp, &id, &outgoing))
+                                .then_some(id)
+                            });
+                        if let Some(att_id) = waiting_cp
+                            && !self.is_cancelled(&att_id)
+                        {
+                            match inner.vault.upload(peer, &att_id).await {
+                                _ if !self.is_live(vgen) => return Ok(false),
+                                Ok(Some(_)) => {}
+                                Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {
+                                    match self
+                                        .fail_waiting(inner, peer, outgoing.history_index)
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            if !self.is_live(vgen) {
+                                                return Ok(false);
+                                            }
+                                            let _ = inner.vault.forget_upload(peer, &att_id).await;
+                                            if !self.is_live(vgen) {
+                                                return Ok(false);
+                                            }
+                                            changed = true;
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            result = Err(e);
+                                            step = NextPush::Done;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    result = Err(describe(&e));
+                                    step = NextPush::Done;
+                                    break;
+                                }
+                            }
+                        }
                         step = NextPush::Done;
                         break;
                     }
@@ -349,20 +425,43 @@ impl<V: VaultStore> Engine<V> {
                     let pause_sealing = contact.state.quarantined
                         || contact.state.classical_approval_needed != CLASSICAL_APPROVAL_NONE
                         || contact.state.security_alert != SECURITY_ALERT_NONE;
-                    // R12-P1-4 + R13-P2-1 + R13-P1-3 + R14-P2-2 + R14-P2-3: Never seal or announce
-                    // an un-dispatched attachment whose upload has 0 chunks uploaded to the server
-                    // (whether `UPLOAD_STATE_STARTED` or `UPLOAD_STATE_ANNOUNCED`, and even if its
-                    // separate `HistoryEntry` or `PendingUpload` record is missing/corrupt) without
-                    // a live, non-cancelled file handle in memory.
+                    // R12-P1-4 + R13-P2-1 + R13-P1-3 + R14-P2-2 + R14-P2-3 + R16-P1-2 + R16-P2-5 +
+                    // R16-P2-6 + R16-P2-7: Guard un-dispatched attachments tracked by a `STARTED`
+                    // or `ANNOUNCED` checkpoint — blocking 0-chunk uploads without a live file
+                    // handle, AND settling incomplete orphaned multi-chunk uploads (even when
+                    // `cp.uploaded > 0`) before publishing an unresumable pointer.
                     let mut zero_chunk_att_id: Option<[u8; 16]> = None;
                     if !outgoing.dispatched {
-                        let unuploaded = inner.vault.unuploaded_started_upload_ids(peer);
-                        if !unuploaded.is_empty() {
-                            let mut matched_att_id =
+                        let tracked_started: Vec<(crate::vault::UploadCheckpoint, [u8; 16])> =
+                            inner
+                                .vault
+                                .tracked_upload_checkpoints(Some(peer))
+                                .into_iter()
+                                .filter_map(|cp| {
+                                    if matches!(
+                                        cp.upload_state,
+                                        crate::vault::UPLOAD_STATE_STARTED
+                                            | crate::vault::UPLOAD_STATE_ANNOUNCED
+                                    ) {
+                                        let id = <[u8; 16]>::try_from(cp.id.as_slice()).ok()?;
+                                        Some((cp, id))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                        if !tracked_started.is_empty() {
+                            let find_cp = |att_id: [u8; 16]| {
+                                tracked_started
+                                    .iter()
+                                    .find(|(_, id)| *id == att_id)
+                                    .cloned()
+                            };
+                            let mut matched_cp =
                                 <[u8; 16]>::try_from(outgoing.attachment_id.as_slice())
                                     .ok()
-                                    .filter(|id| unuploaded.contains(id));
-                            if matched_att_id.is_none() {
+                                    .and_then(find_cp);
+                            if matched_cp.is_none() {
                                 match inner.vault.entry(peer, outgoing.history_index).await {
                                     _ if !self.is_live(vgen) => return Ok(false),
                                     Ok(Some(entry)) => {
@@ -370,18 +469,16 @@ impl<V: VaultStore> Engine<V> {
                                             entry.content.as_ref().and_then(|c| c.kind.as_ref())
                                             && let Ok(att_id) =
                                                 <[u8; 16]>::try_from(ptr.id.as_slice())
-                                            && unuploaded.contains(&att_id)
                                         {
-                                            matched_att_id = Some(att_id);
+                                            matched_cp = find_cp(att_id);
                                         }
                                     }
                                     Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {
-                                        // R14-P2-2 + R15-P2-9: Missing OR corrupt `HistoryEntry`
-                                        // must neither bypass the zero-chunk guard for an
-                                        // attachment nor block an unrelated intact text message
-                                        // ahead of a paused attachment. Inspect the independent
-                                        // unsealed `OutgoingRecord` and authenticated checkpoint
-                                        // index to identify whether this head is the attachment.
+                                        // R14-P2-2 + R15-P2-9 + R16-P2-7: Inspect unsealed
+                                        // `OutgoingRecord` first; if it proves a non-attachment
+                                        // `Kind`, skip checkpoint fallback so an unrelated
+                                        // checkpoint can never collide with this head.
+                                        let mut proved_non_attachment = false;
                                         if !outgoing.sealed {
                                             match inner
                                                 .vault
@@ -389,16 +486,21 @@ impl<V: VaultStore> Engine<V> {
                                                 .await
                                             {
                                                 _ if !self.is_live(vgen) => return Ok(false),
-                                                Ok(rec) => {
-                                                    if let Some(Kind::Attachment(ptr)) =
-                                                        Kind::from_bytes(&rec.content)
-                                                        && let Ok(att_id) =
+                                                Ok(rec) => match Kind::from_bytes(&rec.content) {
+                                                    Some(Kind::Attachment(ptr)) => {
+                                                        if let Ok(att_id) =
                                                             <[u8; 16]>::try_from(ptr.id.as_slice())
-                                                        && unuploaded.contains(&att_id)
-                                                    {
-                                                        matched_att_id = Some(att_id);
+                                                        {
+                                                            matched_cp = find_cp(att_id);
+                                                        } else {
+                                                            proved_non_attachment = true;
+                                                        }
                                                     }
-                                                }
+                                                    Some(_) => {
+                                                        proved_non_attachment = true;
+                                                    }
+                                                    None => {}
+                                                },
                                                 Err(crate::vault::Error::Corrupt(_)) => {}
                                                 Err(e) => {
                                                     result = Err(describe(&e));
@@ -407,18 +509,15 @@ impl<V: VaultStore> Engine<V> {
                                                 }
                                             }
                                         }
-                                        if matched_att_id.is_none() {
-                                            matched_att_id = inner
-                                                .vault
-                                                .tracked_upload_checkpoints(Some(peer))
-                                                .into_iter()
-                                                .find_map(|cp| {
-                                                    let id = <[u8; 16]>::try_from(cp.id.as_slice())
-                                                        .ok()?;
-                                                    (cp.history_index == outgoing.history_index
-                                                        && unuploaded.contains(&id))
-                                                    .then_some(id)
-                                                });
+                                        if matched_cp.is_none() && !proved_non_attachment {
+                                            matched_cp = tracked_started
+                                                .iter()
+                                                .find(|(cp, id)| {
+                                                    super::checkpoint_matches_outbox(
+                                                        cp, id, &outgoing,
+                                                    )
+                                                })
+                                                .cloned();
                                         }
                                     }
                                     Err(e) => {
@@ -428,57 +527,97 @@ impl<V: VaultStore> Engine<V> {
                                     }
                                 }
                             }
-                            if let Some(att_id) = matched_att_id {
-                                if self.is_cancelled(&att_id)
-                                    || !self.uploads.has_file(peer, &att_id)
-                                {
-                                    // R14-P2-3: If the separate `PendingUpload` record is missing
-                                    // or corrupt (no resumable UI card exists), fail this
-                                    // un-dispatched orphaned head cleanly and forget its
-                                    // checkpoint so later messages to `peer` are never wedged.
-                                    if !self.is_cancelled(&att_id) {
-                                        let orphan = matches!(
-                                            inner.vault.upload(peer, &att_id).await,
-                                            Ok(None) | Err(crate::vault::Error::Corrupt(_))
-                                        );
-                                        if !self.is_live(vgen) {
-                                            return Ok(false);
+                            if let Some((cp, att_id)) = matched_cp {
+                                let is_zero_chunk = cp.uploaded == 0;
+                                let need_zero_guard = is_zero_chunk
+                                    && (self.is_cancelled(&att_id)
+                                        || !self.uploads.has_file(peer, &att_id));
+                                let need_orphan_check = !self.is_cancelled(&att_id)
+                                    && (need_zero_guard
+                                        || (!is_zero_chunk && !self.uploads.is_running(&att_id)));
+                                if need_orphan_check {
+                                    let orphan = match inner.vault.upload(peer, &att_id).await {
+                                        _ if !self.is_live(vgen) => return Ok(false),
+                                        Ok(Some(_)) => false,
+                                        Ok(None) | Err(crate::vault::Error::Corrupt(_)) => true,
+                                        Err(e) => {
+                                            result = Err(describe(&e));
+                                            step = NextPush::Done;
+                                            break;
                                         }
-                                        if orphan {
-                                            // R15-P2-6: Before failing an orphaned 0-chunk head,
-                                            // check `chunks_kept` against the attachment's declared
-                                            // size (since `cp.uploaded` is saved before PUTting
-                                            // each chunk). If already complete, only forget the
-                                            // stale checkpoint and continue pushing.
-                                            let is_complete = if let Some(size) = inner
-                                                .attachment_size_for_outbox(
-                                                    peer,
-                                                    outgoing.history_index,
-                                                    &att_id,
-                                                    outgoing.sealed,
-                                                )
+                                    };
+                                    if orphan {
+                                        // R15-P2-6 + R16-P2-6: Check completion via fallible
+                                        // size + `chunks_kept` lookups so transient storage errors
+                                        // never fail a completed upload.
+                                        let size = match inner
+                                            .attachment_size_for_outbox(
+                                                peer,
+                                                outgoing.history_index,
+                                                &att_id,
+                                                outgoing.sealed,
+                                            )
+                                            .await
+                                        {
+                                            _ if !self.is_live(vgen) => return Ok(false),
+                                            Ok(size) => size,
+                                            Err(e) => {
+                                                result = Err(describe(&e));
+                                                step = NextPush::Done;
+                                                break;
+                                            }
+                                        };
+                                        let is_complete = if let Some(size) = size {
+                                            let total_chunks =
+                                                session::attachment::chunk_count(size);
+                                            let kept = match inner
+                                                .vault
+                                                .chunks_kept(peer, &att_id)
                                                 .await
                                             {
-                                                if !self.is_live(vgen) {
-                                                    return Ok(false);
+                                                _ if !self.is_live(vgen) => return Ok(false),
+                                                Ok(n) => u64::from(n),
+                                                Err(e) => {
+                                                    result = Err(describe(&e));
+                                                    step = NextPush::Done;
+                                                    break;
                                                 }
-                                                let total_chunks =
-                                                    session::attachment::chunk_count(size);
-                                                let kept = u64::from(
-                                                    inner
-                                                        .vault
-                                                        .chunks_kept(peer, &att_id)
-                                                        .await
-                                                        .unwrap_or(0),
-                                                );
-                                                if !self.is_live(vgen) {
-                                                    return Ok(false);
-                                                }
-                                                kept >= total_chunks
-                                            } else {
-                                                false
                                             };
-                                            if is_complete {
+                                            u64::from(cp.uploaded) >= total_chunks
+                                                || kept >= total_chunks
+                                        } else {
+                                            false
+                                        };
+                                        if is_complete {
+                                            // R16-P1-2: Propagate `forget_upload` errors so
+                                            // persistent write failures release locks instead of
+                                            // busy-looping on this head.
+                                            match inner.vault.forget_upload(peer, &att_id).await {
+                                                Ok(()) => {
+                                                    if !self.is_live(vgen) {
+                                                        return Ok(false);
+                                                    }
+                                                    changed = true;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    if !self.is_live(vgen) {
+                                                        return Ok(false);
+                                                    }
+                                                    result = Err(describe(&e));
+                                                    step = NextPush::Done;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        match self
+                                            .fail_waiting(inner, peer, outgoing.history_index)
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                if !self.is_live(vgen) {
+                                                    return Ok(false);
+                                                }
                                                 let _ =
                                                     inner.vault.forget_upload(peer, &att_id).await;
                                                 if !self.is_live(vgen) {
@@ -487,36 +626,21 @@ impl<V: VaultStore> Engine<V> {
                                                 changed = true;
                                                 continue;
                                             }
-                                            match self
-                                                .fail_waiting(inner, peer, outgoing.history_index)
-                                                .await
-                                            {
-                                                Ok(()) => {
-                                                    if !self.is_live(vgen) {
-                                                        return Ok(false);
-                                                    }
-                                                    let _ = inner
-                                                        .vault
-                                                        .forget_upload(peer, &att_id)
-                                                        .await;
-                                                    if !self.is_live(vgen) {
-                                                        return Ok(false);
-                                                    }
-                                                    changed = true;
-                                                    continue;
-                                                }
-                                                Err(e) => {
-                                                    result = Err(e);
-                                                    step = NextPush::Done;
-                                                    break;
-                                                }
+                                            Err(e) => {
+                                                result = Err(e);
+                                                step = NextPush::Done;
+                                                break;
                                             }
                                         }
                                     }
+                                }
+                                if need_zero_guard {
                                     step = NextPush::Done;
                                     break;
                                 }
-                                zero_chunk_att_id = Some(att_id);
+                                if is_zero_chunk {
+                                    zero_chunk_att_id = Some(att_id);
+                                }
                             }
                         }
                     }
@@ -613,6 +737,33 @@ impl<V: VaultStore> Engine<V> {
                                         )
                                     });
                                     self.show_changes(inner, peer, &history);
+                                    // R16-P1-1: Settling a dispatched head unblocks deferred
+                                    // `needs_requeue_sealed` before the next item seals/pushes.
+                                    if was_dispatched
+                                        && inner
+                                            .contact(peer)
+                                            .is_some_and(|c| c.state.needs_requeue_sealed)
+                                    {
+                                        match inner.requeue_before_push(peer).await {
+                                            Ok(Some(outcome)) => {
+                                                if !self.is_live(vgen) {
+                                                    return Ok(false);
+                                                }
+                                                outcome.log_missing(&self.ui, peer);
+                                                self.show_changes(inner, peer, &outcome.history);
+                                            }
+                                            Ok(None) => {
+                                                if !self.is_live(vgen) {
+                                                    return Ok(false);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                result = Err(e);
+                                                step = NextPush::Done;
+                                                break;
+                                            }
+                                        }
+                                    }
                                     changed = true;
                                     continue;
                                 }
@@ -705,6 +856,33 @@ impl<V: VaultStore> Engine<V> {
                                     ));
                                 }
                                 self.show_changes(inner, peer, &history);
+                                // R16-P1-1: Settling a dispatched head unblocks deferred
+                                // `needs_requeue_sealed` before the next item seals/pushes.
+                                if was_dispatched
+                                    && inner
+                                        .contact(peer)
+                                        .is_some_and(|c| c.state.needs_requeue_sealed)
+                                {
+                                    match inner.requeue_before_push(peer).await {
+                                        Ok(Some(outcome)) => {
+                                            if !self.is_live(vgen) {
+                                                return Ok(false);
+                                            }
+                                            outcome.log_missing(&self.ui, peer);
+                                            self.show_changes(inner, peer, &outcome.history);
+                                        }
+                                        Ok(None) => {
+                                            if !self.is_live(vgen) {
+                                                return Ok(false);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            result = Err(e);
+                                            step = NextPush::Done;
+                                            break;
+                                        }
+                                    }
+                                }
                                 changed = true;
                                 continue;
                             }
@@ -793,6 +971,37 @@ impl<V: VaultStore> Engine<V> {
                                 {
                                     Ok(CommitOutcome::Committed) => {
                                         self.release(peer, outgoing.history_index);
+                                        // R16-P1-1: Settling a superseded dispatched head unblocks
+                                        // deferred `needs_requeue_sealed` so the next queued item
+                                        // seals/pushes cleanly with `session_matches == true`.
+                                        if inner
+                                            .contact(peer)
+                                            .is_some_and(|c| c.state.needs_requeue_sealed)
+                                        {
+                                            match inner.requeue_before_push(peer).await {
+                                                Ok(Some(outcome)) => {
+                                                    if !self.is_live(vgen) {
+                                                        return Ok(false);
+                                                    }
+                                                    outcome.log_missing(&self.ui, peer);
+                                                    self.show_changes(
+                                                        inner,
+                                                        peer,
+                                                        &outcome.history,
+                                                    );
+                                                }
+                                                Ok(None) => {
+                                                    if !self.is_live(vgen) {
+                                                        return Ok(false);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    result = Err(e);
+                                                    step = NextPush::Done;
+                                                    break;
+                                                }
+                                            }
+                                        }
                                         changed = true;
                                         continue;
                                     }

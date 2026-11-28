@@ -1683,6 +1683,12 @@ pub struct Farewell {
     /// and the 32-byte `write_token`.
     #[prost(bytes = "vec", tag = "3")]
     pub push_v2: Vec<u8>,
+    /// `true` if a carried classical v1 `initial_message` inside `push_v2` was explicitly approved
+    /// by the user under local PQ policy when this farewell was created (`R16-P2-4`). When `false`
+    /// (including legacy/PQ-OFF farewells), `say_farewells` strips any carried v1 initial once
+    /// ordinary local PQ or `strict_pq` is active.
+    #[prost(bool, tag = "4")]
+    pub allow_classical_initial: bool,
 }
 
 impl Farewell {
@@ -1700,6 +1706,7 @@ impl Farewell {
 impl Drop for Farewell {
     fn drop(&mut self) {
         self.push_v2.zeroize();
+        self.allow_classical_initial = false;
     }
 }
 
@@ -2998,31 +3005,8 @@ impl Vault {
         Ok(Some(upload))
     }
 
-    /// IDs of started uploads (`UPLOAD_STATE_STARTED | UPLOAD_STATE_ANNOUNCED`) for `peer` whose
-    /// authenticated checkpoint still records `uploaded == 0`, even if the separate upload record
-    /// is missing or failed authentication (`R13-P2-1`, `R13-P1-3`).
-    pub fn unuploaded_started_upload_ids(&self, peer: &PublicKey) -> Vec<[u8; 16]> {
-        self.upload_checkpoints
-            .borrow()
-            .iter()
-            .filter_map(|cp| {
-                if cp.peer.as_slice() == peer.as_slice()
-                    && cp.uploaded == 0
-                    && matches!(
-                        cp.upload_state,
-                        UPLOAD_STATE_STARTED | UPLOAD_STATE_ANNOUNCED
-                    )
-                {
-                    <[u8; 16]>::try_from(cp.id.as_slice()).ok()
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     /// Snapshot of all authenticated upload checkpoints tracked by the vault header (optionally
-    /// filtered to `peer`), enabling orphan-checkpoint recovery on unlock and cancel when a
+    /// filtered to `peer`), enabling orphan-checkpoint recovery on unlock, flush, and cancel when a
     /// separate `PendingUpload` record is missing or failed authentication (`R14-P2-3`).
     pub fn tracked_upload_checkpoints(&self, peer: Option<&PublicKey>) -> Vec<UploadCheckpoint> {
         self.upload_checkpoints
@@ -3613,6 +3597,7 @@ mod tests {
 
         let farewell = Farewell {
             push_v2: vec![0xDD; 48],
+            allow_classical_initial: false,
         };
         requires_wipe_on_drop(&farewell);
         let fdbg = format!("{farewell:?}");

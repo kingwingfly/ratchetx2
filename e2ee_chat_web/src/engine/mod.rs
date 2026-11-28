@@ -124,20 +124,33 @@ pub const MAX_FILE_SIZE: usize = DEFAULT_MAX_CHUNKS as usize * CHUNK_SIZE;
 pub use crate::util::{NAME_MAX, sanitize_shared_name};
 
 /// Whether current local policy forbids transmitting or accepting a classical X3DH session
-/// (`R14-P1-1`, `R14-P1-2`), matching `session/src/pq.rs`. When `!local_pq && !strict_pq`,
-/// `peer_pq.pq_pinned` is a TOFU capability record learned from the peer's manifest while
-/// classical negotiation remains allowed.
+/// (`R14-P1-1`, `R14-P1-2`, `R16-P1-3`), matching `session/src/pq.rs:1143-1162`:
+/// - `strict_pq` always blocks classical.
+/// - `!local_pq && !strict_pq` allows classical (even when `peer_pq.pq_pinned` recorded TOFU).
+/// - When `local_pq && !strict_pq`, classical is allowed ONLY when `!downgrade_detected`, the
+///   user explicitly approved `allow_classical_exception`, AND either the peer was never
+///   PQ-pinned or the peer published a newer verified signed PQ-OFF manifest
+///   (`pinned_manifest_seq > 0 && !peer_pq_capable`).
 pub(super) fn classical_policy_blocked(
     strict_pq: bool,
     local_pq: bool,
     peer_pq: &session::PeerPqState,
 ) -> bool {
-    strict_pq || (local_pq && (peer_pq.pq_pinned || !peer_pq.allow_classical_exception))
+    if strict_pq {
+        return true;
+    }
+    if !local_pq {
+        return false;
+    }
+    if peer_pq.downgrade_detected || !peer_pq.allow_classical_exception {
+        return true;
+    }
+    peer_pq.peer_pq_capable || (peer_pq.pq_pinned && peer_pq.pinned_manifest_seq == 0)
 }
 
 /// Whether archived classical sessions in `contact.session.others` may be retained and have
-/// relay write tokens registered (`R13-P1-1`, `R14-P1-1`). Always `false` once an active PQ
-/// session exists, `strict_pq` is enabled, or an explicit `pin_pq` invitation is being applied.
+/// relay write tokens registered (`R13-P1-1`, `R14-P1-1`, `R16-P1-3`). Always `false` once an
+/// active PQ session exists, `strict_pq` is enabled, or an explicit `pin_pq` invitation is applied.
 pub(super) fn allow_earlier_classical_sessions(
     strict_pq: bool,
     local_pq: bool,
@@ -152,10 +165,38 @@ pub(super) fn allow_earlier_classical_sessions(
     if !local_pq {
         return true;
     }
-    if peer_pq.pq_pinned {
+    if peer_pq.downgrade_detected
+        || peer_pq.peer_pq_capable
+        || (peer_pq.pq_pinned && peer_pq.pinned_manifest_seq == 0)
+    {
         return false;
     }
     explicit_allow_classical || peer_pq.allow_classical_exception
+}
+
+/// Whether authenticated upload checkpoint `cp` (with validated 16-byte `cp_id`) corresponds to
+/// outbox entry `o` (`R16-P2-7`):
+/// - When `o.attachment_id` is populated, compare attachment IDs directly.
+/// - Otherwise match by `cp.upload_state` + `cp.history_index` (including valid `history_index == 0`
+///   for `UPLOAD_STATE_WAITING` / `UPLOAD_STATE_ANNOUNCED`, while NEVER matching unannounced
+///   `UPLOAD_STATE_STARTED` checkpoints whose `history_index == 0` is a sentinel).
+pub(super) fn checkpoint_matches_outbox(
+    cp: &crate::vault::UploadCheckpoint,
+    cp_id: &[u8; 16],
+    o: &crate::vault::Outgoing,
+) -> bool {
+    if !o.attachment_id.is_empty() {
+        return o.attachment_id.as_slice() == cp_id.as_slice();
+    }
+    match cp.upload_state {
+        crate::vault::UPLOAD_STATE_WAITING => {
+            o.awaits_upload && o.history_index == cp.history_index
+        }
+        crate::vault::UPLOAD_STATE_ANNOUNCED => {
+            !o.awaits_upload && o.history_index == cp.history_index
+        }
+        _ => false,
+    }
 }
 
 /// `name`, trimmed, unless it is longer than [`NAME_MAX`].
@@ -1601,57 +1642,66 @@ impl Engine<Vault> {
                         c.state
                             .outbox
                             .iter()
-                            .find(|o| {
-                                o.attachment_id.as_slice() == cp_id.as_slice()
-                                    || (cp.history_index > 0 && o.history_index == cp.history_index)
-                            })
+                            .find(|o| checkpoint_matches_outbox(&cp, &cp_id, o))
                             .map(|o| (o.history_index, o.dispatched, o.awaits_upload, o.sealed))
                     });
-                    if outbox_match.is_none()
-                        && let Ok(Some((idx, entry))) =
-                            inner.find_attachment_entry(&cp_peer, None, &cp_id).await
-                        && entry.outgoing
-                    {
-                        if !self.is_live(vgen) {
-                            return false;
+                    if outbox_match.is_none() {
+                        let hint_idx = (cp.upload_state == crate::vault::UPLOAD_STATE_ANNOUNCED)
+                            .then_some(cp.history_index);
+                        match inner
+                            .find_attachment_entry(&cp_peer, hint_idx, &cp_id)
+                            .await
+                        {
+                            _ if !self.is_live(vgen) => return false,
+                            Ok(Some((idx, entry))) if entry.outgoing => {
+                                outbox_match = inner.contact(&cp_peer).and_then(|c| {
+                                    c.state.outbox.iter().find(|o| o.history_index == idx).map(
+                                        |o| {
+                                            (
+                                                o.history_index,
+                                                o.dispatched,
+                                                o.awaits_upload,
+                                                o.sealed,
+                                            )
+                                        },
+                                    )
+                                });
+                            }
+                            Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
+                            Err(_) => continue,
                         }
-                        outbox_match = inner.contact(&cp_peer).and_then(|c| {
-                            c.state
-                                .outbox
-                                .iter()
-                                .find(|o| o.history_index == idx)
-                                .map(|o| (o.history_index, o.dispatched, o.awaits_upload, o.sealed))
-                        });
                     }
                     if let Some((idx, dispatched, awaits_upload, sealed)) = outbox_match
                         && !dispatched
                     {
-                        // R15-P2-6: Check actual completion via attachment size and `chunks_kept`
-                        // (since `cp.uploaded` is saved before PUTting each chunk). Never fail a
-                        // completed 1-chunk upload; DO fail any un-dispatched incomplete orphan
-                        // (including multi-chunk orphans with `0 < cp.uploaded < total_chunks`
-                        // that can never resume without their `PendingUpload` record).
+                        // R15-P2-6 + R16-P2-6: Check actual completion via fallible attachment size
+                        // and `chunks_kept` lookups so transient storage errors never fail a
+                        // completed 1-chunk upload, while incomplete orphans are failed cleanly.
                         let is_complete = if !awaits_upload
                             && matches!(
                                 cp.upload_state,
                                 crate::vault::UPLOAD_STATE_STARTED
                                     | crate::vault::UPLOAD_STATE_ANNOUNCED
-                            )
-                            && let Some(size) = inner
+                            ) {
+                            let size = match inner
                                 .attachment_size_for_outbox(&cp_peer, idx, &cp_id, sealed)
                                 .await
-                        {
-                            if !self.is_live(vgen) {
-                                return false;
+                            {
+                                _ if !self.is_live(vgen) => return false,
+                                Ok(size) => size,
+                                Err(_) => continue,
+                            };
+                            if let Some(size) = size {
+                                let total_chunks = attachment::chunk_count(size);
+                                let kept = match inner.vault.chunks_kept(&cp_peer, &cp_id).await {
+                                    _ if !self.is_live(vgen) => return false,
+                                    Ok(n) => u64::from(n),
+                                    Err(_) => continue,
+                                };
+                                u64::from(cp.uploaded) >= total_chunks || kept >= total_chunks
+                            } else {
+                                false
                             }
-                            let total_chunks = attachment::chunk_count(size);
-                            let kept = u64::from(
-                                inner.vault.chunks_kept(&cp_peer, &cp_id).await.unwrap_or(0),
-                            );
-                            if !self.is_live(vgen) {
-                                return false;
-                            }
-                            u64::from(cp.uploaded) >= total_chunks || kept >= total_chunks
                         } else {
                             false
                         };
@@ -1676,8 +1726,14 @@ impl Engine<Vault> {
                 if orphans_settled && self.is_live(vgen) {
                     self.refresh_contacts(&inner);
                 }
+                self.uploads.set_restore_needed(false);
             }
-            Err(e) if self.is_live(vgen) && !cancelled() => self.ui.notify(describe(&e)),
+            Err(e) if self.is_live(vgen) && !cancelled() => {
+                // R16-P2-10: Retry upload-card restoration (including started 0-chunk uploads)
+                // and orphan-checkpoint cleanup in `sync()` once vault storage recovers.
+                self.uploads.set_restore_needed(true);
+                self.ui.notify(describe(&e));
+            }
             Err(_) => {
                 if cancelled() {
                     drop(inner);
@@ -1760,6 +1816,207 @@ impl Engine<Vault> {
 }
 
 impl<V: VaultStore> Engine<V> {
+    /// Retry restoring paused upload cards (both started and waiting) and settling orphaned
+    /// upload checkpoints after a transient `vault.uploads(None)` failure during unlock
+    /// (`R16-P2-10`). Acquires `Engine::inner` only for card restoration and `peer_flush_lock` ->
+    /// `Engine::inner` per peer for orphan settlement (preserving Lock DAG `1 -> 5`).
+    pub(super) async fn restore_uploads_from_vault(&self) -> Result<(), String> {
+        let vgen = self.vault_gen();
+        let orphan_peers: Vec<PublicKey> = {
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let Some(inner) = guard.as_mut() else {
+                return Ok(());
+            };
+            let uploads = inner.vault.uploads(None).await.map_err(|e| describe(&e))?;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let shown_ids: HashSet<(PublicKey, [u8; 16])> = self
+                .ui
+                .uploads
+                .get_untracked()
+                .into_iter()
+                .map(|u| (u.peer, u.id))
+                .collect();
+            let mut present_uploads = shown_ids.clone();
+            for (peer, pending) in uploads {
+                if !self.is_live(vgen) {
+                    return Ok(());
+                }
+                let Ok(id) = <[u8; 16]>::try_from(pending.id.as_slice()) else {
+                    continue;
+                };
+                if self.is_cancelled(&id) || self.uploads.is_running(&id) {
+                    present_uploads.insert((peer, id));
+                    continue;
+                }
+                let chunks = attachment::chunk_count(pending.size);
+                if pending.started() {
+                    let kept = match inner.vault.chunks_kept(&peer, &pending.id).await {
+                        _ if !self.is_live(vgen) => return Ok(()),
+                        Ok(n) => u64::from(n),
+                        Err(e) => return Err(describe(&e)),
+                    };
+                    if u64::from(pending.uploaded) >= chunks || kept >= chunks {
+                        let _ = inner.vault.forget_upload(&peer, &pending.id).await;
+                        continue;
+                    }
+                } else if !inner.contacts.iter().any(|c| {
+                    c.peer == peer
+                        && c.state
+                            .outbox
+                            .iter()
+                            .any(|o| o.history_index == pending.history_index && o.awaits_upload)
+                }) {
+                    let _ = inner.vault.forget_upload(&peer, &pending.id).await;
+                    continue;
+                }
+                present_uploads.insert((peer, id));
+                if !shown_ids.contains(&(peer, id)) {
+                    let reason = if pending.started() {
+                        "choose the file again to go on"
+                    } else {
+                        self.hold(&peer, pending.history_index);
+                        "choose the file again, then sign in to the server"
+                    };
+                    self.show_upload(&peer, &pending, UploadState::Paused(reason.to_string()));
+                }
+            }
+            let mut peers = std::collections::BTreeSet::new();
+            for cp in inner.vault.tracked_upload_checkpoints(None) {
+                let Ok(cp_peer) = PublicKey::try_from(cp.peer.as_slice()) else {
+                    continue;
+                };
+                let Ok(cp_id) = <[u8; 16]>::try_from(cp.id.as_slice()) else {
+                    continue;
+                };
+                if !present_uploads.contains(&(cp_peer, cp_id)) {
+                    peers.insert(cp_peer);
+                }
+            }
+            self.uploads.set_restore_needed(false);
+            peers.into_iter().collect()
+        };
+        for cp_peer in orphan_peers {
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let peer_lock = self.queue.peer_flush_lock(&cp_peer);
+            let _peer_guard = peer_lock.lock().await;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let Some(inner) = guard.as_mut() else {
+                return Ok(());
+            };
+            let mut orphans_settled = false;
+            for cp in inner.vault.tracked_upload_checkpoints(Some(&cp_peer)) {
+                let Ok(cp_id) = <[u8; 16]>::try_from(cp.id.as_slice()) else {
+                    continue;
+                };
+                if self.is_cancelled(&cp_id) || self.uploads.is_running(&cp_id) {
+                    continue;
+                }
+                let is_missing_or_corrupt = matches!(
+                    inner.vault.upload(&cp_peer, &cp_id).await,
+                    Ok(None) | Err(crate::vault::Error::Corrupt(_))
+                );
+                if !self.is_live(vgen) {
+                    return Ok(());
+                }
+                if !is_missing_or_corrupt {
+                    continue;
+                }
+                let mut outbox_match = inner.contact(&cp_peer).and_then(|c| {
+                    c.state
+                        .outbox
+                        .iter()
+                        .find(|o| checkpoint_matches_outbox(&cp, &cp_id, o))
+                        .map(|o| (o.history_index, o.dispatched, o.awaits_upload, o.sealed))
+                });
+                if outbox_match.is_none() {
+                    let hint_idx = (cp.upload_state == crate::vault::UPLOAD_STATE_ANNOUNCED)
+                        .then_some(cp.history_index);
+                    match inner
+                        .find_attachment_entry(&cp_peer, hint_idx, &cp_id)
+                        .await
+                    {
+                        _ if !self.is_live(vgen) => return Ok(()),
+                        Ok(Some((idx, entry))) if entry.outgoing => {
+                            outbox_match = inner.contact(&cp_peer).and_then(|c| {
+                                c.state
+                                    .outbox
+                                    .iter()
+                                    .find(|o| o.history_index == idx)
+                                    .map(|o| {
+                                        (o.history_index, o.dispatched, o.awaits_upload, o.sealed)
+                                    })
+                            });
+                        }
+                        Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
+                        Err(_) => continue,
+                    }
+                }
+                if let Some((idx, dispatched, awaits_upload, sealed)) = outbox_match
+                    && !dispatched
+                {
+                    let is_complete = if !awaits_upload
+                        && matches!(
+                            cp.upload_state,
+                            crate::vault::UPLOAD_STATE_STARTED
+                                | crate::vault::UPLOAD_STATE_ANNOUNCED
+                        ) {
+                        let size = match inner
+                            .attachment_size_for_outbox(&cp_peer, idx, &cp_id, sealed)
+                            .await
+                        {
+                            _ if !self.is_live(vgen) => return Ok(()),
+                            Ok(size) => size,
+                            Err(_) => continue,
+                        };
+                        if let Some(size) = size {
+                            let total_chunks = attachment::chunk_count(size);
+                            let kept = match inner.vault.chunks_kept(&cp_peer, &cp_id).await {
+                                _ if !self.is_live(vgen) => return Ok(()),
+                                Ok(n) => u64::from(n),
+                                Err(_) => continue,
+                            };
+                            u64::from(cp.uploaded) >= total_chunks || kept >= total_chunks
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if !is_complete {
+                        if self.fail_waiting(inner, &cp_peer, idx).await.is_err() {
+                            if !self.is_live(vgen) {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        if !self.is_live(vgen) {
+                            return Ok(());
+                        }
+                        orphans_settled = true;
+                    }
+                }
+                let _ = inner.vault.forget_upload(&cp_peer, &cp_id).await;
+            }
+            if orphans_settled && self.is_live(vgen) {
+                self.refresh_contacts(inner);
+            }
+        }
+        Ok(())
+    }
+
     /// Save `content` for `peer`, then push it, encrypted as its turn comes. What the user sends
     /// goes through [`Engine::queue`], to go in order.
     async fn send(&self, peer: PublicKey, content: Kind) -> Result<(), String> {
@@ -2660,6 +2917,7 @@ impl<V: VaultStore> Engine<V> {
         self.purge_peer_transient_state(&peer);
         self.uploads.remove_peer_files(&peer);
         self.uploads.remove_peer_cancel_rollbacks(&peer);
+        self.uploads.remove_peer_pending_cancels(&peer);
         self.media.remove_peer(&peer);
         if self
             .ui
@@ -2834,7 +3092,6 @@ pub(crate) trait VaultStore: 'static {
         &self,
         peer: Option<&PublicKey>,
     ) -> crate::vault::Result<Vec<(PublicKey, PendingUpload)>>;
-    fn unuploaded_started_upload_ids(&self, peer: &PublicKey) -> Vec<[u8; 16]>;
     fn tracked_upload_checkpoints(
         &self,
         peer: Option<&PublicKey>,
@@ -2946,9 +3203,6 @@ impl VaultStore for Vault {
         peer: Option<&PublicKey>,
     ) -> crate::vault::Result<Vec<(PublicKey, PendingUpload)>> {
         Vault::uploads(self, peer).await
-    }
-    fn unuploaded_started_upload_ids(&self, peer: &PublicKey) -> Vec<[u8; 16]> {
-        Vault::unuploaded_started_upload_ids(self, peer)
     }
     fn tracked_upload_checkpoints(
         &self,
@@ -3377,30 +3631,42 @@ impl<V: VaultStore> Inner<V> {
         conv_gen
     }
 
-    /// Stage a durable `RegisterWriteToken` grant on `peer`'s session using the next monotonic
-    /// identity-wide `grant_version`.
+    /// Look up the declared byte size of attachment `id` for outbox item `(peer, idx)` from
+    /// history or (when unsealed) the independent `OutgoingRecord`, propagating non-`Corrupt`
+    /// storage errors so transient IDB read failures never discard a completed upload (`R16-P2-6`).
     pub(super) async fn attachment_size_for_outbox(
         &self,
         peer: &PublicKey,
         idx: u64,
         id: &[u8],
         sealed: bool,
-    ) -> Option<u64> {
-        if let Ok(Some(entry)) = self.vault.entry(peer, idx).await
-            && let Some(Kind::Attachment(ptr)) =
-                entry.content.as_ref().and_then(|c| c.kind.as_ref())
-            && ptr.id.as_slice() == id
-        {
-            return Some(ptr.size);
+    ) -> crate::vault::Result<Option<u64>> {
+        match self.vault.entry(peer, idx).await {
+            Ok(Some(entry)) => {
+                if let Some(Kind::Attachment(ptr)) =
+                    entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                    && ptr.id.as_slice() == id
+                {
+                    return Ok(Some(ptr.size));
+                }
+            }
+            Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {}
+            Err(e) => return Err(e),
         }
-        if !sealed
-            && let Ok(rec) = self.vault.outgoing(peer, idx).await
-            && let Some(Kind::Attachment(ptr)) = Kind::from_bytes(&rec.content)
-            && ptr.id.as_slice() == id
-        {
-            return Some(ptr.size);
+        if !sealed {
+            match self.vault.outgoing(peer, idx).await {
+                Ok(rec) => {
+                    if let Some(Kind::Attachment(ptr)) = Kind::from_bytes(&rec.content)
+                        && ptr.id.as_slice() == id
+                    {
+                        return Ok(Some(ptr.size));
+                    }
+                }
+                Err(crate::vault::Error::Corrupt(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
-        None
+        Ok(None)
     }
 
     pub(super) fn stage_write_token_revoke(&mut self, peer: &PublicKey) {

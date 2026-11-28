@@ -55,6 +55,12 @@ pub(super) struct UploadRegistry {
     cancelled: RefCell<HashSet<[u8; 16]>>,
     /// Promoted uploads cancelled after promotion whose rollback transaction failed transiently.
     pending_cancel_rollbacks: RefCell<HashMap<(PublicKey, u64), PendingCancelRollback>>,
+    /// Cancellations requested on this page whose local vault settlement failed transiently
+    /// (`R16-P2-9`), retried by `Engine::flush` and `Engine::sync` until committed.
+    pending_cancellations: RefCell<HashSet<(PublicKey, [u8; 16])>>,
+    /// Set when `Engine::unlocked`'s initial `vault.uploads(None)` read failed transiently
+    /// (`R16-P2-10`), triggering retry of upload-card restoration and orphan recovery in `sync()`.
+    uploads_restore_needed: Cell<bool>,
 }
 
 impl UploadRegistry {
@@ -140,11 +146,53 @@ impl UploadRegistry {
             .retain(|(p, _), _| p != peer);
     }
 
+    pub(super) fn insert_pending_cancel(&self, peer: PublicKey, id: [u8; 16]) {
+        self.pending_cancellations.borrow_mut().insert((peer, id));
+    }
+
+    pub(super) fn remove_pending_cancel(&self, peer: &PublicKey, id: &[u8; 16]) {
+        self.pending_cancellations
+            .borrow_mut()
+            .remove(&(*peer, *id));
+    }
+
+    pub(super) fn remove_peer_pending_cancels(&self, peer: &PublicKey) {
+        self.pending_cancellations
+            .borrow_mut()
+            .retain(|(p, _)| p != peer);
+    }
+
+    pub(super) fn pending_cancels_for_peer(&self, peer: &PublicKey) -> Vec<[u8; 16]> {
+        self.pending_cancellations
+            .borrow()
+            .iter()
+            .filter_map(|(p, id)| (p == peer).then_some(*id))
+            .collect()
+    }
+
+    pub(super) fn pending_cancels(&self) -> Vec<(PublicKey, [u8; 16])> {
+        self.pending_cancellations
+            .borrow()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    pub(super) fn set_restore_needed(&self, needed: bool) {
+        self.uploads_restore_needed.set(needed);
+    }
+
+    pub(super) fn restore_needed(&self) -> bool {
+        self.uploads_restore_needed.get()
+    }
+
     pub(super) fn clear_on_teardown(&self) {
         self.files.borrow_mut().clear();
         self.running.borrow_mut().clear();
         self.cancelled.borrow_mut().clear();
         self.pending_cancel_rollbacks.borrow_mut().clear();
+        self.pending_cancellations.borrow_mut().clear();
+        self.uploads_restore_needed.set(false);
     }
 
     #[cfg(all(test, not(target_arch = "wasm32")))]

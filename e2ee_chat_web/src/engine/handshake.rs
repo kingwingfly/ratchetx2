@@ -4655,7 +4655,11 @@ impl<V: VaultStore> Engine<V> {
                 }
                 rolled_back_on_cancel = true;
             } else {
-                let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
+                let Some(contact) = inner
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == peer && c.state.conversation_gen == created_conv_gen)
+                else {
                     self.startup.end_new_chat_submit(submission_id);
                     return Err(StartChatError::Cancelled);
                 };
@@ -4664,16 +4668,19 @@ impl<V: VaultStore> Engine<V> {
                     let mut crossed_winner_blocked_err: Option<StartChatError> = None;
                     let strict_pq_now = inner.client.pq_config().strict_pq;
                     let local_pq_now = inner.local_pq_enabled();
+                    let prev_contact = inner.contact(&peer).map(|c| c.snapshot());
+                    let prev_pending_revokes = inner.state.pending_revokes.clone();
                     if let Some(c) = inner.contact(&peer)
                         && c.state.provisional
                     {
                         c.state.provisional = false;
                         let active_is_pq = c.session.security().is_some_and(|s| s.is_pq);
-                        // R15-P1-3: If a crossed peer classical session won the tie-break while
-                        // Phase 2's `RegisterWriteToken` was in flight and `strict_pq` or local
-                        // PQ policy now blocks classical sessions, do NOT authorize the classical
-                        // winner's write token: convert it to a pending request, revoke Phase 2's
-                        // provisional grant, and return the policy error.
+                        // R15-P1-3 + R16-P2-1: If a crossed peer classical session won the
+                        // tie-break while Phase 2's `RegisterWriteToken` was in flight and
+                        // `strict_pq` or local PQ policy now blocks classical sessions, do NOT
+                        // authorize the classical winner's write token: convert it to a pending
+                        // request, record `SECURITY_ALERT_DOWNGRADE` for PQ-pinned peers, revoke
+                        // Phase 2's provisional grant, and return the matching policy error.
                         let winner_blocked_by_pq = !active_is_pq
                             && !c.state.request
                             && !c.state.quarantined
@@ -4686,13 +4693,26 @@ impl<V: VaultStore> Engine<V> {
                             c.state.request = true;
                             c.session.clear_pending_grants();
                             c.session.prune_classical_earlier();
+                            let is_downgrade =
+                                !strict_pq_now && (pin_pq || c.session.peer_pq_state().pq_pinned);
                             if strict_pq_now {
+                                if pin_pq {
+                                    c.session.pin_peer_pq();
+                                }
                                 c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                            } else if is_downgrade {
+                                if pin_pq {
+                                    c.session.pin_peer_pq();
+                                }
+                                c.session.peer_pq_state_mut().downgrade_detected = true;
+                                c.state.security_alert = SECURITY_ALERT_DOWNGRADE;
                             }
                             inner.stage_write_token_revoke(&peer);
                             flush_winning_grant = true;
                             crossed_winner_blocked_err = Some(if strict_pq_now {
                                 StartChatError::PqRequired
+                            } else if is_downgrade {
+                                StartChatError::DowngradeDetected
                             } else {
                                 StartChatError::ExistingClassicalRequestApprovalRequired
                             });
@@ -4751,7 +4771,25 @@ impl<V: VaultStore> Engine<V> {
                                 }
                             }
                         }
-                        if inner.save_state().await.is_err() {
+                        if let Err(e) = inner.save_state().await {
+                            if !self.is_live(vgen) {
+                                return Err(StartChatError::Cancelled);
+                            }
+                            // R16-P2-2: On the allowed-winner acceptance path, require acceptance
+                            // and staged grants to commit durably BEFORE issuing
+                            // `RegisterWriteToken` or returning `Ok(peer)` so a reload cannot
+                            // revert the provisional contact and revoke the registered token.
+                            if crossed_winner_blocked_err.is_none() {
+                                if let Some(snapshot) = prev_contact {
+                                    let _ = inner.roll_back(&peer, snapshot);
+                                }
+                                inner.state.pending_revokes = prev_pending_revokes;
+                                self.startup.end_new_chat_submit(submission_id);
+                                self.refresh_contacts(inner);
+                                drop(guard);
+                                drop(peer_guard);
+                                return Err(StartChatError::Other(describe(&e)));
+                            }
                             inner.unsaved_state = true;
                         }
                         if !self.is_live(vgen) {
@@ -4818,6 +4856,28 @@ impl<V: VaultStore> Engine<V> {
                                 self.wake();
                             }
                             return Err(StartChatError::Cancelled);
+                        }
+                        // R16-P2-3: Re-verify `created_conv_gen` after awaiting the winning-grant
+                        // RPC so a concurrent `delete_for_gen` (+ replacement inbound request)
+                        // cannot cause `start_chat` to return `Ok(peer)` for a deleted chat.
+                        if crossed_winner_blocked_err.is_none() {
+                            let guard = self.lock_inner().await;
+                            if !self.is_live(vgen) {
+                                return Err(StartChatError::Cancelled);
+                            }
+                            let still_same_chat = guard.as_ref().is_some_and(|inner| {
+                                inner.contacts.iter().any(|c| {
+                                    c.peer == peer
+                                        && c.state.conversation_gen == created_conv_gen
+                                        && !c.state.provisional
+                                })
+                            });
+                            drop(guard);
+                            if !still_same_chat {
+                                self.startup.end_new_chat_submit(submission_id);
+                                drop(peer_guard);
+                                return Err(StartChatError::Cancelled);
+                            }
                         }
                     }
                     self.startup.end_new_chat_submit(submission_id);
@@ -5581,8 +5641,11 @@ pub(super) fn build_farewell_for_session(
     if strip_initial {
         v2.initial_message = None;
     }
+    let allow_classical_initial = v2.initial_message.as_ref().is_some_and(|w| w.version < 2)
+        && !super::classical_policy_blocked(false, true, session.peer_pq_state());
     Farewell {
         push_v2: v2.encode_to_vec(),
+        allow_classical_initial,
     }
 }
 

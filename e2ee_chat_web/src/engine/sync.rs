@@ -885,6 +885,29 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return false;
         }
+        // R16-P2-10: If unlock's initial `vault.uploads(None)` failed transiently, retry restoring
+        // paused upload cards (including started 0-chunk uploads) and settling orphan checkpoints.
+        if self.uploads.restore_needed() {
+            if let Err(e) = self.restore_uploads_from_vault().await {
+                failure.get_or_insert(e);
+            }
+            if !self.is_live(vgen) {
+                return false;
+            }
+        }
+        // R16-P2-9: Retry any `cancel_upload` whose local vault settlement failed transiently so
+        // empty-outbox or stalled peers never remain stranded with no upload card to re-cancel.
+        for (cancel_peer, cancel_id) in self.uploads.pending_cancels() {
+            if !self.is_live(vgen) {
+                return false;
+            }
+            if let Err(e) = self.cancel_upload(cancel_peer, cancel_id).await {
+                failure.get_or_insert(e);
+            }
+        }
+        if !self.is_live(vgen) {
+            return false;
+        }
         self.refresh_server_info(false).await;
         if !self.is_live(vgen) {
             return false;
@@ -1090,13 +1113,16 @@ impl<V: VaultStore> Engine<V> {
                     inner.save_state().await.map_err(|e| describe(&e))?;
                     continue;
                 };
-                // R15-P2-1: Never transmit a carried classical v1 initial message inside a
-                // farewell (including persisted `fallback_farewells`) once `strict_pq` is active.
-                if inner.client.pq_config().strict_pq
-                    && v2_req
-                        .initial_message
-                        .as_ref()
-                        .is_some_and(|w| w.version < 2)
+                // R15-P2-1 + R16-P2-4: Never transmit a carried classical v1 initial message inside
+                // a farewell (including persisted `fallback_farewells`) once `strict_pq` is active,
+                // or once ordinary local PQ is enabled without an explicit classical exception
+                // recorded on the farewell.
+                if v2_req
+                    .initial_message
+                    .as_ref()
+                    .is_some_and(|w| w.version < 2)
+                    && (inner.client.pq_config().strict_pq
+                        || (inner.local_pq_enabled() && !farewell.allow_classical_initial))
                 {
                     v2_req.initial_message = None;
                 }
