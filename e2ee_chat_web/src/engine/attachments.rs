@@ -1049,7 +1049,7 @@ impl<V: VaultStore> Engine<V> {
             }
             reverted?;
             if self.is_live(vgen)
-                && let Err(e) = self.flush(&peer).await
+                && let Err(e) = self.flush_with_mode(&peer, background).await
                 && self.is_live(vgen)
             {
                 self.ui.link.set(Link::Offline(e));
@@ -1078,7 +1078,7 @@ impl<V: VaultStore> Engine<V> {
         });
         self.show_upload(&peer, &pending, UploadState::Running);
         self.release(&peer, kept.history_index);
-        if let Err(e) = self.flush(&peer).await
+        if let Err(e) = self.flush_with_mode(&peer, background).await
             && self.is_live(vgen)
         {
             self.ui.link.set(Link::Offline(e));
@@ -1947,7 +1947,12 @@ impl<V: VaultStore> Engine<V> {
             self.finish_server_deletes(&peer, delete_jobs).await;
         }
         if should_flush && self.is_live(vgen) {
-            if let Err(e) = self.flush(&peer).await
+            // R25-P1-1 + R25-P2-1: Clear any stale peer sign-in wait held by the cancelled upload
+            // so the next queued message attempts delivery or gets marked in `ui.held`, while
+            // flushing in background mode so cancelling an upload never pops `Dialog::SignIn`
+            // after the user declined sign-in or during an active `start_chat`.
+            self.queue.clear_peer_sign_in_wait(&peer);
+            if let Err(e) = self.flush_background(&peer).await
                 && self.is_live(vgen)
             {
                 self.ui.link.set(Link::Offline(e));
@@ -2122,7 +2127,10 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
         self.queue.clear_peer_sign_in_wait(&peer);
-        if let Err(e) = self.flush(&peer).await
+        // R25-P2-1: Flush the next message in background mode so cancelling a held message does
+        // not pop `Dialog::SignIn` after the user declined sign-in, while still marking the next
+        // head in `ui.held` on 403.
+        if let Err(e) = self.flush_background(&peer).await
             && self.is_live(vgen)
         {
             self.ui.link.set(Link::Offline(e));
@@ -3361,7 +3369,10 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        self.flush(&peer).await.map(drop)
+        // R25-P2-1: Downloaded receipts fire automatically after unauthenticated `GetChunk`
+        // fetches (including inline media); flush in background mode so they honor
+        // `declined_sign_in` and `in_flight_start_chat`.
+        self.flush_background(&peer).await.map(drop)
     }
 
     /// Whether the viewer still waits for the attachment `id` of preview request `token`.

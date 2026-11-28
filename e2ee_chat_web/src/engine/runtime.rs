@@ -732,6 +732,9 @@ pub(super) struct StartupFlow {
     /// Whether publishing prekeys was refused for sign-in: waits for sign-in rather than retrying
     /// every sync round.
     publish_waits_sign_in: Cell<bool>,
+    /// Whether pushing queued deletion farewells was refused for sign-in: waits for sign-in rather
+    /// than hitting `403 SignInRequired` on every background `sync()` round (`R25-P3-2`).
+    farewells_wait_sign_in: Cell<bool>,
     /// Whether publishing prekeys was definitively refused for the current settings with no
     /// rollback snapshot: background publishing pauses until the user adjusts settings or retries.
     publish_waits_settings: Cell<bool>,
@@ -765,6 +768,14 @@ impl StartupFlow {
         self.publish_waits_sign_in.set(waits);
     }
 
+    pub(super) fn farewells_wait_sign_in(&self) -> bool {
+        self.farewells_wait_sign_in.get()
+    }
+
+    pub(super) fn set_farewells_wait_sign_in(&self, waits: bool) {
+        self.farewells_wait_sign_in.set(waits);
+    }
+
     pub(super) fn set_publish_waits_settings(&self, waits: bool) {
         self.publish_waits_settings.set(waits);
     }
@@ -791,9 +802,23 @@ impl StartupFlow {
     pub(super) fn on_resume_after_sign_in(&self) {
         self.sign_in_flow.borrow_mut().reset_declined();
         self.publish_waits_sign_in.set(false);
+        self.farewells_wait_sign_in.set(false);
     }
 
     pub(super) fn on_ask_sign_in(&self, current_dialog: Option<&Dialog>) -> Option<Dialog> {
+        // R25-P2-3: When a persisted `start_chat` / existing-contact acceptance flush hits
+        // `SignInRequired` while `Dialog::NewChat` is still mounted, route directly through
+        // `on_chat_created_greeting_needs_sign_in` instead of letting `SignInFlow::on_ask_sign_in`
+        // mint a fresh orphan `pending_new_chat` ID from `active_new_chat`.
+        if let Some((id, true)) = self.in_flight_start_chat.get()
+            && !self.is_submission_cancelled(id)
+        {
+            return self.can_sign_in_here.get().then(|| {
+                self.sign_in_flow
+                    .borrow_mut()
+                    .on_chat_created_greeting_needs_sign_in(id)
+            });
+        }
         self.sign_in_flow.borrow_mut().on_ask_sign_in(
             current_dialog,
             self.can_sign_in_here.get(),
@@ -801,14 +826,19 @@ impl StartupFlow {
         )
     }
 
-    /// Background sign-in prompt (`R24-P1-1`, `R24-P2-4`): honors `declined_sign_in` ("Not now" /
-    /// Escape) and skips whenever an unrelated `start_chat` submission is currently in flight so
-    /// background sync/publish/refill/farewell/auto-upgrade 403s never hijack or cancel it.
+    /// Background sign-in prompt (`R24-P1-1`, `R24-P2-4`, `R25-P2-2`): honors `declined_sign_in`
+    /// ("Not now" / Escape) and skips whenever an unrelated active (non-cancelled) `start_chat`
+    /// submission is currently in flight so background sync/publish/refill/farewell/auto-upgrade
+    /// 403s never hijack or cancel it.
     pub(super) fn on_ask_sign_in_background(
         &self,
         current_dialog: Option<&Dialog>,
     ) -> Option<Dialog> {
-        if self.in_flight_start_chat.get().is_some() {
+        if self
+            .in_flight_start_chat
+            .get()
+            .is_some_and(|(id, _)| !self.is_submission_cancelled(id))
+        {
             return None;
         }
         self.sign_in_flow.borrow_mut().on_ask_sign_in(
@@ -1067,11 +1097,15 @@ impl StartupFlow {
     pub(super) fn clear_on_teardown(&self) {
         self.unlocking.set(false);
         self.publish_waits_sign_in.set(false);
+        self.farewells_wait_sign_in.set(false);
         self.publish_waits_settings.set(false);
         self.clock_skew_warned.set(false);
         *self.new_chat_feedback.borrow_mut() = None;
         self.pending_new_chat_off_pins.borrow_mut().clear();
         self.cancel_active_submissions();
+        // R25-P2-2: Drop any stale `in_flight_start_chat` from a locked/torn-down vault generation
+        // so it cannot suppress `on_ask_sign_in_background` after a new vault unlocks.
+        self.in_flight_start_chat.set(None);
     }
 }
 

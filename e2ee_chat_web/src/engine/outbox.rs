@@ -97,12 +97,21 @@ impl<V: VaultStore> Engine<V> {
         self.flush_with_mode(peer, true).await
     }
 
-    async fn flush_with_mode(&self, peer: &PublicKey, background: bool) -> Result<bool, String> {
+    pub(super) async fn flush_with_mode(
+        &self,
+        peer: &PublicKey,
+        background: bool,
+    ) -> Result<bool, String> {
         let vgen = self.vault_gen();
         if !self.is_live(vgen) {
             return Ok(false);
         }
-        if self.queue.waits_for_sign_in(peer) || self.queue.is_approval_backed_off(peer) {
+        // R25-P1-1: Only background flushes short-circuit on a prior `waits_for_sign_in` flag so
+        // explicit interactive sends/accepts/starts still attempt delivery (picking up a sign-in
+        // from another tab), mark the head in `ui.held`, and re-open `Dialog::SignIn` on 403.
+        if (background && self.queue.waits_for_sign_in(peer))
+            || self.queue.is_approval_backed_off(peer)
+        {
             return Ok(false);
         }
         // With messages waiting and no session to send on, the peer may have started one, e.g.
@@ -137,7 +146,9 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(false);
         }
-        if self.queue.waits_for_sign_in(peer) || self.queue.is_approval_backed_off(peer) {
+        if (background && self.queue.waits_for_sign_in(peer))
+            || self.queue.is_approval_backed_off(peer)
+        {
             return Ok(false);
         }
 
@@ -146,12 +157,16 @@ impl<V: VaultStore> Engine<V> {
         let mut server_deletes: Vec<ServerDeleteJob> = vec![];
         let mut signs_in_here = false;
         let mut tried_grant_flush = false;
+        let mut hit_sign_in_required = false;
 
         loop {
             if !self.is_live(vgen) {
                 return Ok(false);
             }
-            if self.queue.waits_for_sign_in(peer) || self.queue.is_approval_backed_off(peer) {
+            if hit_sign_in_required
+                || (background && self.queue.waits_for_sign_in(peer))
+                || self.queue.is_approval_backed_off(peer)
+            {
                 break;
             }
 
@@ -635,126 +650,31 @@ impl<V: VaultStore> Engine<V> {
                                                     // fail the outbox item + forget the upload, and
                                                     // clear caches/UI so flush neither ships a dead
                                                     // partial pointer nor wedges on 0-chunk rows.
-                                                    let mut del_key =
+                                                    let initial_del_key =
                                                         super::attachments::copy_zeroizing_array::<
                                                             { session::attachment::KEY_LENGTH },
                                                         >(
                                                             &pending.key
                                                         );
-                                                    if del_key.is_none() {
-                                                        match inner
-                                                            .vault
-                                                            .entry(peer, outgoing.history_index)
-                                                            .await
-                                                        {
-                                                            _ if !self.is_live(vgen) => {
-                                                                return Ok(false);
-                                                            }
-                                                            Ok(Some(entry)) => {
-                                                                if let Some(Kind::Attachment(ptr)) =
-                                                                    entry.content.as_ref().and_then(
-                                                                        |c| c.kind.as_ref(),
-                                                                    )
-                                                                {
-                                                                    del_key =
-                                                                        super::attachments::copy_zeroizing_array::<
-                                                                            {
-                                                                                session::attachment::KEY_LENGTH
-                                                                            },
-                                                                        >(
-                                                                            &ptr.key
-                                                                        );
-                                                                }
-                                                            }
-                                                            Ok(None)
-                                                            | Err(crate::vault::Error::Corrupt(
-                                                                _,
-                                                            )) => {}
-                                                            Err(e) => {
-                                                                result = Err(describe(&e));
-                                                                step = NextPush::Done;
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                    if del_key.is_none() && !outgoing.sealed {
-                                                        match inner
-                                                            .vault
-                                                            .outgoing(peer, outgoing.history_index)
-                                                            .await
-                                                        {
-                                                            _ if !self.is_live(vgen) => {
-                                                                return Ok(false);
-                                                            }
-                                                            Ok(rec) => {
-                                                                if let Some(Kind::Attachment(ptr)) =
-                                                                    Kind::from_bytes(&rec.content)
-                                                                {
-                                                                    del_key =
-                                                                        super::attachments::copy_zeroizing_array::<
-                                                                            {
-                                                                                session::attachment::KEY_LENGTH
-                                                                            },
-                                                                        >(
-                                                                            &ptr.key
-                                                                        );
-                                                                }
-                                                            }
-                                                            Err(crate::vault::Error::Corrupt(
-                                                                _,
-                                                            )) => {}
-                                                            Err(e) => {
-                                                                result = Err(describe(&e));
-                                                                step = NextPush::Done;
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
                                                     match self
-                                                        .fail_outbox_and_forget_upload(
+                                                        .fail_unresumable_upload_outbox(
                                                             vgen,
                                                             inner,
                                                             peer,
-                                                            outgoing.history_index,
-                                                            &att_id,
-                                                            false,
+                                                            &outgoing,
+                                                            att_id,
+                                                            initial_del_key,
+                                                            pending.name.clone(),
+                                                            &mut server_deletes,
                                                         )
                                                         .await
                                                     {
-                                                        Ok(()) => {
-                                                            if !self.is_live(vgen) {
-                                                                return Ok(false);
-                                                            }
-                                                            self.uploads.mark_cancelled(att_id);
-                                                            self.uploads
-                                                                .clear_server_completed(&att_id);
-                                                            self.remove_attachment_caches(
-                                                                peer, &att_id,
-                                                            );
-                                                            self.ui.uploads.update(|uploads| {
-                                                                uploads.retain(|u| u.id != att_id)
-                                                            });
-                                                            if let Some(key) = del_key {
-                                                                server_deletes.push(
-                                                                    ServerDeleteJob::for_completed(
-                                                                        inner.server.clone(),
-                                                                        att_id,
-                                                                        Some(
-                                                                            outgoing.history_index,
-                                                                        ),
-                                                                        pending.name.clone(),
-                                                                        key,
-                                                                    ),
-                                                                );
-                                                            }
-                                                            self.refresh_contacts(inner);
+                                                        Ok(true) => {
                                                             changed = true;
                                                             continue;
                                                         }
+                                                        Ok(false) => return Ok(false),
                                                         Err(e) => {
-                                                            if !self.is_live(vgen) {
-                                                                return Ok(false);
-                                                            }
                                                             result = Err(e);
                                                             step = NextPush::Done;
                                                             break;
@@ -834,24 +754,29 @@ impl<V: VaultStore> Engine<V> {
                                                     }
                                                 }
                                             }
+                                            // R25-P2-4: Mirror malformed-upload cleanup for
+                                            // incomplete orphan checkpoints (`Ok(None)` or
+                                            // `Err(Corrupt(_))`): recover `ptr.key` for
+                                            // `DeleteCompleted`, atomically fail outbox + forget
+                                            // upload, and clear cancellation/caches/UI.
                                             match self
-                                                .fail_waiting(inner, peer, outgoing.history_index)
+                                                .fail_unresumable_upload_outbox(
+                                                    vgen,
+                                                    inner,
+                                                    peer,
+                                                    &outgoing,
+                                                    att_id,
+                                                    None,
+                                                    String::new(),
+                                                    &mut server_deletes,
+                                                )
                                                 .await
                                             {
-                                                Ok(()) => {
-                                                    if !self.is_live(vgen) {
-                                                        return Ok(false);
-                                                    }
-                                                    let _ = inner
-                                                        .vault
-                                                        .forget_upload(peer, &att_id)
-                                                        .await;
-                                                    if !self.is_live(vgen) {
-                                                        return Ok(false);
-                                                    }
+                                                Ok(true) => {
                                                     changed = true;
                                                     continue;
                                                 }
+                                                Ok(false) => return Ok(false),
                                                 Err(e) => {
                                                     result = Err(e);
                                                     step = NextPush::Done;
@@ -1593,7 +1518,13 @@ impl<V: VaultStore> Engine<V> {
                     {
                         Ok(RekeyOutcome::Aborted) => return Ok(false),
                         Ok(RekeyOutcome::Ready) => continue,
-                        Ok(RekeyOutcome::Paused | RekeyOutcome::ContactGone) => break,
+                        Ok(RekeyOutcome::Paused) => {
+                            if self.queue.waits_for_sign_in(peer) {
+                                hit_sign_in_required = true;
+                            }
+                            break;
+                        }
+                        Ok(RekeyOutcome::ContactGone) => break,
                         Ok(RekeyOutcome::Failed) => {
                             // R8-P1-2: `fail_waiting` already failed every unsealed item in
                             // `outbox` (and is a no-op when `outbox` is empty with
@@ -1818,6 +1749,7 @@ impl<V: VaultStore> Engine<V> {
 
                     match push_res {
                         Ok(()) => {
+                            self.queue.clear_peer_sign_in_wait(peer);
                             if let Some(in_flight) = inner.in_flight_push.get_mut(peer) {
                                 in_flight.relayed = true;
                             }
@@ -2161,6 +2093,7 @@ impl<V: VaultStore> Engine<V> {
                                     } else if let Some(retry_res) = retry_res {
                                         match retry_res {
                                             Ok(()) => {
+                                                self.queue.clear_peer_sign_in_wait(peer);
                                                 if let Some(contact) = inner.contact(peer) {
                                                     contact.mark_greeting_confirmed();
                                                     if !greeting_unconfirmed {
@@ -2254,6 +2187,7 @@ impl<V: VaultStore> Engine<V> {
                                                     && signs_in_here
                                                 {
                                                     self.queue.mark_waits_sign_in(*peer);
+                                                    hit_sign_in_required = true;
                                                     self.hold(peer, outgoing.history_index);
                                                     self.ask_sign_in_for(background);
                                                     self.refresh_contacts(inner);
@@ -2316,6 +2250,7 @@ impl<V: VaultStore> Engine<V> {
                         // signed in to it: it waits, with those after it, until this browser is.
                         Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
                             self.queue.mark_waits_sign_in(*peer);
+                            hit_sign_in_required = true;
                             self.hold(peer, outgoing.history_index);
                             self.ask_sign_in_for(background);
                             break;
@@ -2415,7 +2350,8 @@ impl<V: VaultStore> Engine<V> {
         if result.is_ok()
             && signs_in_here
             && self.is_live(vgen)
-            && !self.queue.waits_for_sign_in(peer)
+            && !hit_sign_in_required
+            && !(background && self.queue.waits_for_sign_in(peer))
             && !self.queue.is_approval_backed_off(peer)
         {
             match self.push_events(vgen, peer, background).await {
@@ -2427,6 +2363,95 @@ impl<V: VaultStore> Engine<V> {
             self.finish_server_deletes(peer, server_deletes).await;
         }
         result.map(|()| changed)
+    }
+
+    /// Recover any 32-byte attachment delete key + filename from history/outgoing, atomically fail
+    /// the outbox item and forget the corrupt/orphaned upload checkpoint, clear caches/UI, and
+    /// enqueue `ServerDeleteJob::for_completed` (`R24-P2-1`, `R25-P2-4`).
+    ///
+    /// Returns `Ok(true)` when settled, `Ok(false)` when the vault generation became stale, or
+    /// `Err(msg)` on transient storage errors.
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_unresumable_upload_outbox(
+        &self,
+        vgen: u64,
+        inner: &mut Inner<V>,
+        peer: &PublicKey,
+        outgoing: &Outgoing,
+        att_id: [u8; 16],
+        mut del_key: Option<zeroize::Zeroizing<[u8; session::attachment::KEY_LENGTH]>>,
+        mut name: String,
+        server_deletes: &mut Vec<ServerDeleteJob>,
+    ) -> Result<bool, String> {
+        if del_key.is_none() || name.is_empty() {
+            match inner.vault.entry(peer, outgoing.history_index).await {
+                _ if !self.is_live(vgen) => return Ok(false),
+                Ok(Some(entry)) => {
+                    if let Some(Kind::Attachment(ptr)) =
+                        entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                    {
+                        if del_key.is_none() {
+                            del_key = super::attachments::copy_zeroizing_array::<
+                                { session::attachment::KEY_LENGTH },
+                            >(&ptr.key);
+                        }
+                        if name.is_empty() {
+                            name = ptr.name.clone();
+                        }
+                    }
+                }
+                Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {}
+                Err(e) => return Err(describe(&e)),
+            }
+        }
+        if (del_key.is_none() || name.is_empty()) && !outgoing.sealed {
+            match inner.vault.outgoing(peer, outgoing.history_index).await {
+                _ if !self.is_live(vgen) => return Ok(false),
+                Ok(rec) => {
+                    if let Some(Kind::Attachment(ptr)) = Kind::from_bytes(&rec.content) {
+                        if del_key.is_none() {
+                            del_key = super::attachments::copy_zeroizing_array::<
+                                { session::attachment::KEY_LENGTH },
+                            >(&ptr.key);
+                        }
+                        if name.is_empty() {
+                            name = ptr.name.clone();
+                        }
+                    }
+                }
+                Err(crate::vault::Error::Corrupt(_)) => {}
+                Err(e) => return Err(describe(&e)),
+            }
+        }
+        self.fail_outbox_and_forget_upload(
+            vgen,
+            inner,
+            peer,
+            outgoing.history_index,
+            &att_id,
+            false,
+        )
+        .await?;
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
+        self.uploads.mark_cancelled(att_id);
+        self.uploads.clear_server_completed(&att_id);
+        self.remove_attachment_caches(peer, &att_id);
+        self.ui
+            .uploads
+            .update(|uploads| uploads.retain(|u| u.id != att_id));
+        if let Some(key) = del_key {
+            server_deletes.push(ServerDeleteJob::for_completed(
+                inner.server.clone(),
+                att_id,
+                Some(outgoing.history_index),
+                name,
+                key,
+            ));
+        }
+        self.refresh_contacts(inner);
+        Ok(true)
     }
 
     /// Commit one pushed or permanently refused outbox head entry immediately to the vault,
@@ -2662,11 +2687,20 @@ impl<V: VaultStore> Engine<V> {
         if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &error) {
             return Ok(RekeyOutcome::UpdateRequired(describe(&error)));
         }
-        // R22-P2-7: Handle `SignInRequired` ONLY after `ensure_session_for_outbox` verified the
-        // live `conversation_gen` so a late 403 for a deleted/replaced chat never opens sign-in.
+        // R22-P2-7 + R25-P1-1: Handle `SignInRequired` ONLY after `ensure_session_for_outbox`
+        // verified the live `conversation_gen` so a late 403 for a deleted/replaced chat never
+        // opens sign-in, and mark any non-`awaits_upload` outbox head in `ui.held`.
         if kind == ErrorKind::SignInRequired {
             if same_server(&inner.server, &origin()) {
                 self.queue.mark_waits_sign_in(*peer);
+                if let Some(head_idx) = inner
+                    .contact(peer)
+                    .and_then(|c| c.state.outbox.first())
+                    .filter(|o| !o.awaits_upload)
+                    .map(|o| o.history_index)
+                {
+                    self.hold(peer, head_idx);
+                }
                 self.ask_sign_in_for(background);
                 self.refresh_contacts(inner);
                 return Ok(RekeyOutcome::Paused);
@@ -3089,14 +3123,16 @@ impl<V: VaultStore> Engine<V> {
         let matches_session = contact_cur.session.active_id() == new_session_id.as_ref();
         match send_res {
             Ok(()) => {
-                if matches_session
-                    && inner
+                if matches_session {
+                    self.queue.clear_peer_sign_in_wait(peer);
+                    if inner
                         .contact(peer)
                         .is_some_and(Contact::mark_greeting_confirmed)
-                {
-                    let _ = inner.save_state().await;
-                    if !self.is_live(vgen) {
-                        return Ok(RekeyOutcome::Aborted);
+                    {
+                        let _ = inner.save_state().await;
+                        if !self.is_live(vgen) {
+                            return Ok(RekeyOutcome::Aborted);
+                        }
                     }
                 }
             }
@@ -3122,6 +3158,14 @@ impl<V: VaultStore> Engine<V> {
                 }
                 if e.kind() == ErrorKind::SignInRequired && signs_in_here {
                     self.queue.mark_waits_sign_in(*peer);
+                    if let Some(head_idx) = inner
+                        .contact(peer)
+                        .and_then(|c| c.state.outbox.first())
+                        .filter(|o| !o.awaits_upload)
+                        .map(|o| o.history_index)
+                    {
+                        self.hold(peer, head_idx);
+                    }
                     self.ask_sign_in_for(background);
                     self.refresh_contacts(inner);
                     return Ok(RekeyOutcome::Paused);
@@ -3419,6 +3463,7 @@ impl<V: VaultStore> Engine<V> {
         match push_res {
             Ok(_) => {
                 if matches_sealed {
+                    self.queue.clear_peer_sign_in_wait(peer);
                     self.clear_approval_backoff(peer);
                 }
             }

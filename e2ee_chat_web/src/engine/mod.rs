@@ -1581,6 +1581,15 @@ impl Engine<Vault> {
                             }
                             continue;
                         }
+                        // R25-P3-3 + R23-P2-2: Incomplete malformed/empty-token `STARTED` /
+                        // `ANNOUNCED` rows can never resume (`upload_of` fails). Preserve the
+                        // record so `pending.key` stays available for Cancel/Delete (`R23-P2-2`),
+                        // and surface the corrupt error directly instead of mis-prompting
+                        // `"choose the file again to go on"`.
+                        if let Err(err) = attachments::upload_of(&pending) {
+                            self.show_upload(&peer, &pending, UploadState::Paused(err));
+                            continue;
+                        }
                     }
                     // Stale unstarted waiting upload whose outbox entry was already promoted to a
                     // real upload (or failed/sent) before `forget_upload` committed.
@@ -1933,6 +1942,15 @@ impl<V: VaultStore> Engine<V> {
                                 .uploads
                                 .update(|uploads| uploads.retain(|upload| upload.id != id));
                         }
+                        continue;
+                    }
+                    // R25-P3-3 + R23-P2-2: Incomplete malformed/empty-token `STARTED` /
+                    // `ANNOUNCED` rows can never resume (`upload_of` fails). Preserve the record
+                    // so `pending.key` stays available for Cancel/Delete (`R23-P2-2`), and surface
+                    // the corrupt error directly instead of mis-prompting to re-pick the file.
+                    if let Err(err) = attachments::upload_of(&pending) {
+                        present_uploads.insert((peer, id));
+                        self.show_upload(&peer, &pending, UploadState::Paused(err));
                         continue;
                     }
                 } else if !inner.contacts.iter().any(|c| {
@@ -2329,9 +2347,10 @@ impl<V: VaultStore> Engine<V> {
         }
         self.refresh_contacts(inner);
         drop(guard);
-        // The peer learns what was read.
+        // The peer learns what was read (`R25-P2-1`: passive chat open flushes in background mode
+        // so it honors `declined_sign_in` and `in_flight_start_chat`).
         if read
-            && let Err(e) = self.flush(&peer).await
+            && let Err(e) = self.flush_background(&peer).await
             && self.is_live(vgen)
         {
             self.ui.link.set(Link::Offline(e));
@@ -2585,7 +2604,9 @@ impl<V: VaultStore> Engine<V> {
         }
         self.refresh_contacts(inner);
         drop(guard);
-        if let Err(e) = self.flush(&peer).await
+        // R25-P2-1: `mark_read` fires passively on `visibilitychange`; flush in background mode so
+        // it honors `declined_sign_in` and `in_flight_start_chat`.
+        if let Err(e) = self.flush_background(&peer).await
             && self.is_live(vgen)
         {
             self.ui.link.set(Link::Offline(e));

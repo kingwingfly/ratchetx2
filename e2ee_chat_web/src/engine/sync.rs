@@ -1118,7 +1118,7 @@ impl<V: VaultStore> Engine<V> {
     pub(super) async fn say_farewells(&self) -> Result<(), String> {
         let vgen = self.vault_gen();
         loop {
-            if !self.is_live(vgen) {
+            if !self.is_live(vgen) || self.startup.farewells_wait_sign_in() {
                 return Ok(());
             }
             let next = {
@@ -1180,6 +1180,7 @@ impl<V: VaultStore> Engine<V> {
                             })
                     };
                     if still_queued && self.is_live(vgen) {
+                        self.startup.set_farewells_wait_sign_in(true);
                         self.ask_sign_in_background();
                     }
                     return Ok(());

@@ -4522,6 +4522,14 @@ impl<V: VaultStore> Engine<V> {
             )
         };
         drop(guard);
+        // R25-P2-3: Mark this submission as already persisted (`greeting_only = true`) across the
+        // post-accept grant/replay/flush work so a `403 SignInRequired` from `push_events` opens
+        // `Dialog::SignIn` via `on_chat_created_greeting_needs_sign_in(submission_id)` without
+        // minting a fresh orphan `pending_new_chat` ID from `active_new_chat`.
+        self.startup.set_in_flight_start_chat(submission_id, true);
+        let _in_flight = scopeguard::guard((), |()| {
+            self.startup.clear_in_flight_start_chat(submission_id);
+        });
         if phase_b_extra_grants {
             let _ = self.flush_pending_grants_for_peer(&peer).await;
             if !self.is_live(vgen) {
@@ -4562,7 +4570,7 @@ impl<V: VaultStore> Engine<V> {
             BTreeMap::new()
         };
         // R10-P1-2: Release `peer_flush_lock(&peer)` (Rank 1) strictly BEFORE calling
-        // `upgrade_to_pq_auto` or `self.flush(&peer)` (both of which acquire Rank 1).
+        // `upgrade_to_pq_auto` or `self.flush_with_mode(&peer, ...)` (both of which acquire Rank 1).
         drop(peer_guard);
         if accepted_now {
             for (up_peer, conv_gen) in replay_upgrades {
@@ -4571,7 +4579,9 @@ impl<V: VaultStore> Engine<V> {
                 }
                 let _ = self.upgrade_to_pq_auto(up_peer, conv_gen).await;
             }
-            let _ = self.flush(&peer).await;
+            let _ = self
+                .flush_with_mode(&peer, self.is_submission_cancelled(submission_id))
+                .await;
         }
         if (accepted_now || resumed_provisional || revoked_in_phase_b) && self.is_live(vgen) {
             self.wake();
@@ -5726,6 +5736,9 @@ impl<V: VaultStore> Engine<V> {
                     && greeting_still_pending
                     && !self.is_submission_cancelled(submission_id)
                 {
+                    // R25-P3-1: Mark peer sign-in wait before `self.wake()` so `retry_pending_greetings`
+                    // does not immediately send a duplicate guaranteed-403 `SendInitialV2`.
+                    self.queue.mark_waits_sign_in(peer);
                     let dialog = self
                         .startup
                         .on_chat_created_greeting_needs_sign_in(submission_id);
