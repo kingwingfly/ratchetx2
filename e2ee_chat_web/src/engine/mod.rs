@@ -123,34 +123,39 @@ pub const MEDIA_INLINE_MAX: u64 = 8 << 20;
 pub const MAX_FILE_SIZE: usize = DEFAULT_MAX_CHUNKS as usize * CHUNK_SIZE;
 pub use crate::util::{NAME_MAX, sanitize_shared_name};
 
+/// Canonical hard PQ-pin / downgrade block predicate (`R17-P1-1`, `R17-P1-3`):
+/// `true` when an active downgrade is flagged OR the peer is PQ-pinned without a newer verified
+/// signed PQ-OFF manifest (`pinned_manifest_seq > 0 && !peer_pq_capable`). Preserves user-approved
+/// `ServerPqDisabled` fallback sessions where `!pq_pinned && peer_pq_capable && allow_classical_exception`
+/// (`session/src/pq.rs:1104-1109`).
+pub(super) fn classical_hard_blocked_by_pin_or_downgrade(peer_pq: &session::PeerPqState) -> bool {
+    peer_pq.downgrade_detected
+        || (peer_pq.pq_pinned && (peer_pq.peer_pq_capable || peer_pq.pinned_manifest_seq == 0))
+}
+
 /// Whether current local policy forbids transmitting or accepting a classical X3DH session
-/// (`R14-P1-1`, `R14-P1-2`, `R16-P1-3`), matching `session/src/pq.rs:1143-1162`:
+/// (`R14-P1-1`, `R14-P1-2`, `R16-P1-3`, `R17-P1-1`), matching `session/src/pq.rs:1092-1162`:
 /// - `strict_pq` always blocks classical.
 /// - `!local_pq && !strict_pq` allows classical (even when `peer_pq.pq_pinned` recorded TOFU).
 /// - When `local_pq && !strict_pq`, classical is allowed ONLY when `!downgrade_detected`, the
 ///   user explicitly approved `allow_classical_exception`, AND either the peer was never
-///   PQ-pinned or the peer published a newer verified signed PQ-OFF manifest
-///   (`pinned_manifest_seq > 0 && !peer_pq_capable`).
+///   PQ-pinned (including approved `ServerPqDisabled` fallback) or the peer published a newer
+///   verified signed PQ-OFF manifest (`pinned_manifest_seq > 0 && !peer_pq_capable`).
 pub(super) fn classical_policy_blocked(
     strict_pq: bool,
     local_pq: bool,
     peer_pq: &session::PeerPqState,
 ) -> bool {
-    if strict_pq {
-        return true;
-    }
-    if !local_pq {
-        return false;
-    }
-    if peer_pq.downgrade_detected || !peer_pq.allow_classical_exception {
-        return true;
-    }
-    peer_pq.peer_pq_capable || (peer_pq.pq_pinned && peer_pq.pinned_manifest_seq == 0)
+    strict_pq
+        || (local_pq
+            && (classical_hard_blocked_by_pin_or_downgrade(peer_pq)
+                || !peer_pq.allow_classical_exception))
 }
 
 /// Whether archived classical sessions in `contact.session.others` may be retained and have
-/// relay write tokens registered (`R13-P1-1`, `R14-P1-1`, `R16-P1-3`). Always `false` once an
-/// active PQ session exists, `strict_pq` is enabled, or an explicit `pin_pq` invitation is applied.
+/// relay write tokens registered (`R13-P1-1`, `R14-P1-1`, `R16-P1-3`, `R17-P1-1`). Always `false`
+/// once an active PQ session exists, `strict_pq` is enabled, or an explicit `pin_pq` invitation
+/// is applied.
 pub(super) fn allow_earlier_classical_sessions(
     strict_pq: bool,
     local_pq: bool,
@@ -165,10 +170,7 @@ pub(super) fn allow_earlier_classical_sessions(
     if !local_pq {
         return true;
     }
-    if peer_pq.downgrade_detected
-        || peer_pq.peer_pq_capable
-        || (peer_pq.pq_pinned && peer_pq.pinned_manifest_seq == 0)
-    {
+    if classical_hard_blocked_by_pin_or_downgrade(peer_pq) {
         return false;
     }
     explicit_allow_classical || peer_pq.allow_classical_exception
@@ -1517,6 +1519,7 @@ impl Engine<Vault> {
         // Uploads the page left: their files are gone with it.
         match inner.vault.uploads(None).await {
             Ok(uploads) => {
+                let mut restore_incomplete = false;
                 for (peer, pending) in uploads {
                     if !self.is_live(vgen) {
                         return false;
@@ -1528,27 +1531,29 @@ impl Engine<Vault> {
                     }
                     // Done, but left behind, as forgetting it failed (or tab closed after
                     // keeping the final chunk before `forget_upload` committed).
+                    // R17-P2-3: Never swallow transient `chunks_kept` or `forget_upload` errors;
+                    // retain `uploads_restore_needed = true` so `sync()` retries cleanup.
                     let chunks = attachment::chunk_count(pending.size);
-                    if pending.started()
-                        && (u64::from(pending.uploaded) >= chunks
-                            || u64::from(
-                                inner
-                                    .vault
-                                    .chunks_kept(&peer, &pending.id)
-                                    .await
-                                    .unwrap_or(0),
-                            ) >= chunks)
-                    {
-                        if !self.is_live(vgen) {
-                            return false;
-                        }
+                    if pending.started() {
+                        let kept = match inner.vault.chunks_kept(&peer, &pending.id).await {
+                            _ if !self.is_live(vgen) => return false,
+                            Ok(n) => u64::from(n),
+                            Err(_) => {
+                                restore_incomplete = true;
+                                continue;
+                            }
+                        };
                         if cancelled() {
                             drop(inner);
                             self.abort_cancelled_unlock(vgen).await;
                             return false;
                         }
-                        let _ = inner.vault.forget_upload(&peer, &pending.id).await;
-                        continue;
+                        if u64::from(pending.uploaded) >= chunks || kept >= chunks {
+                            if inner.vault.forget_upload(&peer, &pending.id).await.is_err() {
+                                restore_incomplete = true;
+                            }
+                            continue;
+                        }
                     }
                     // Stale unstarted waiting upload whose outbox entry was already promoted to a
                     // real upload (or failed/sent) before `forget_upload` committed.
@@ -1556,7 +1561,10 @@ impl Engine<Vault> {
                         && !inner.contacts.iter().any(|c| {
                             c.peer == peer
                                 && c.state.outbox.iter().any(|o| {
-                                    o.history_index == pending.history_index && o.awaits_upload
+                                    o.history_index == pending.history_index
+                                        && o.awaits_upload
+                                        && (o.attachment_id.is_empty()
+                                            || o.attachment_id == pending.id)
                                 })
                         })
                     {
@@ -1568,7 +1576,9 @@ impl Engine<Vault> {
                             self.abort_cancelled_unlock(vgen).await;
                             return false;
                         }
-                        let _ = inner.vault.forget_upload(&peer, &pending.id).await;
+                        if inner.vault.forget_upload(&peer, &pending.id).await.is_err() {
+                            restore_incomplete = true;
+                        }
                         continue;
                     }
                     if !self.is_live(vgen) {
@@ -1611,10 +1621,7 @@ impl Engine<Vault> {
                     // R15-P2-5: Only classify `Ok(None)` or `Err(Error::Corrupt(_))` as an
                     // orphan; skip both valid records (`Ok(Some(_))`) and transient `Storage`
                     // read errors so temporary IDB glitches never discard a valid upload.
-                    let is_missing_or_corrupt = matches!(
-                        inner.vault.upload(&cp_peer, &cp_id).await,
-                        Ok(None) | Err(crate::vault::Error::Corrupt(_))
-                    );
+                    let upload_lookup = inner.vault.upload(&cp_peer, &cp_id).await;
                     if !self.is_live(vgen) {
                         return false;
                     }
@@ -1623,10 +1630,15 @@ impl Engine<Vault> {
                         self.abort_cancelled_unlock(vgen).await;
                         return false;
                     }
-                    if !is_missing_or_corrupt {
-                        continue;
+                    match upload_lookup {
+                        Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {
+                            orphaned_to_clean.push((cp_peer, cp_id, cp));
+                        }
+                        Ok(Some(_)) => {}
+                        Err(_) => {
+                            restore_incomplete = true;
+                        }
                     }
-                    orphaned_to_clean.push((cp_peer, cp_id, cp));
                 }
                 let mut orphans_settled = false;
                 for (cp_peer, cp_id, cp) in orphaned_to_clean {
@@ -1668,7 +1680,10 @@ impl Engine<Vault> {
                                 });
                             }
                             Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
-                            Err(_) => continue,
+                            Err(_) => {
+                                restore_incomplete = true;
+                                continue;
+                            }
                         }
                     }
                     if let Some((idx, dispatched, awaits_upload, sealed)) = outbox_match
@@ -1689,14 +1704,20 @@ impl Engine<Vault> {
                             {
                                 _ if !self.is_live(vgen) => return false,
                                 Ok(size) => size,
-                                Err(_) => continue,
+                                Err(_) => {
+                                    restore_incomplete = true;
+                                    continue;
+                                }
                             };
                             if let Some(size) = size {
                                 let total_chunks = attachment::chunk_count(size);
                                 let kept = match inner.vault.chunks_kept(&cp_peer, &cp_id).await {
                                     _ if !self.is_live(vgen) => return false,
                                     Ok(n) => u64::from(n),
-                                    Err(_) => continue,
+                                    Err(_) => {
+                                        restore_incomplete = true;
+                                        continue;
+                                    }
                                 };
                                 u64::from(cp.uploaded) >= total_chunks || kept >= total_chunks
                             } else {
@@ -1713,6 +1734,7 @@ impl Engine<Vault> {
                                 if !self.is_live(vgen) {
                                     return false;
                                 }
+                                restore_incomplete = true;
                                 continue;
                             }
                             if !self.is_live(vgen) {
@@ -1721,12 +1743,14 @@ impl Engine<Vault> {
                             orphans_settled = true;
                         }
                     }
-                    let _ = inner.vault.forget_upload(&cp_peer, &cp_id).await;
+                    if inner.vault.forget_upload(&cp_peer, &cp_id).await.is_err() {
+                        restore_incomplete = true;
+                    }
                 }
                 if orphans_settled && self.is_live(vgen) {
                     self.refresh_contacts(&inner);
                 }
-                self.uploads.set_restore_needed(false);
+                self.uploads.set_restore_needed(restore_incomplete);
             }
             Err(e) if self.is_live(vgen) && !cancelled() => {
                 // R16-P2-10: Retry upload-card restoration (including started 0-chunk uploads)
@@ -1822,7 +1846,7 @@ impl<V: VaultStore> Engine<V> {
     /// `Engine::inner` per peer for orphan settlement (preserving Lock DAG `1 -> 5`).
     pub(super) async fn restore_uploads_from_vault(&self) -> Result<(), String> {
         let vgen = self.vault_gen();
-        let orphan_peers: Vec<PublicKey> = {
+        let orphan_peers: (Vec<PublicKey>, bool) = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Ok(());
@@ -1842,6 +1866,7 @@ impl<V: VaultStore> Engine<V> {
                 .map(|u| (u.peer, u.id))
                 .collect();
             let mut present_uploads = shown_ids.clone();
+            let mut restore_incomplete = false;
             for (peer, pending) in uploads {
                 if !self.is_live(vgen) {
                     return Ok(());
@@ -1861,17 +1886,24 @@ impl<V: VaultStore> Engine<V> {
                         Err(e) => return Err(describe(&e)),
                     };
                     if u64::from(pending.uploaded) >= chunks || kept >= chunks {
-                        let _ = inner.vault.forget_upload(&peer, &pending.id).await;
+                        // R17-P2-3: Propagate/retain restore retry if `forget_upload` fails on a
+                        // completed 1-chunk upload so `Engine::flush` is never wedged.
+                        if let Err(e) = inner.vault.forget_upload(&peer, &pending.id).await {
+                            return Err(describe(&e));
+                        }
                         continue;
                     }
                 } else if !inner.contacts.iter().any(|c| {
                     c.peer == peer
-                        && c.state
-                            .outbox
-                            .iter()
-                            .any(|o| o.history_index == pending.history_index && o.awaits_upload)
+                        && c.state.outbox.iter().any(|o| {
+                            o.history_index == pending.history_index
+                                && o.awaits_upload
+                                && (o.attachment_id.is_empty() || o.attachment_id == pending.id)
+                        })
                 }) {
-                    let _ = inner.vault.forget_upload(&peer, &pending.id).await;
+                    if inner.vault.forget_upload(&peer, &pending.id).await.is_err() {
+                        restore_incomplete = true;
+                    }
                     continue;
                 }
                 present_uploads.insert((peer, id));
@@ -1897,9 +1929,9 @@ impl<V: VaultStore> Engine<V> {
                     peers.insert(cp_peer);
                 }
             }
-            self.uploads.set_restore_needed(false);
-            peers.into_iter().collect()
+            (peers.into_iter().collect::<Vec<_>>(), restore_incomplete)
         };
+        let (orphan_peers, mut restore_incomplete) = orphan_peers;
         for cp_peer in orphan_peers {
             if !self.is_live(vgen) {
                 return Ok(());
@@ -1924,15 +1956,17 @@ impl<V: VaultStore> Engine<V> {
                 if self.is_cancelled(&cp_id) || self.uploads.is_running(&cp_id) {
                     continue;
                 }
-                let is_missing_or_corrupt = matches!(
-                    inner.vault.upload(&cp_peer, &cp_id).await,
-                    Ok(None) | Err(crate::vault::Error::Corrupt(_))
-                );
+                let upload_lookup = inner.vault.upload(&cp_peer, &cp_id).await;
                 if !self.is_live(vgen) {
                     return Ok(());
                 }
-                if !is_missing_or_corrupt {
-                    continue;
+                match upload_lookup {
+                    Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {}
+                    Ok(Some(_)) => continue,
+                    Err(_) => {
+                        restore_incomplete = true;
+                        continue;
+                    }
                 }
                 let mut outbox_match = inner.contact(&cp_peer).and_then(|c| {
                     c.state
@@ -1961,7 +1995,10 @@ impl<V: VaultStore> Engine<V> {
                             });
                         }
                         Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
-                        Err(_) => continue,
+                        Err(_) => {
+                            restore_incomplete = true;
+                            continue;
+                        }
                     }
                 }
                 if let Some((idx, dispatched, awaits_upload, sealed)) = outbox_match
@@ -1979,14 +2016,20 @@ impl<V: VaultStore> Engine<V> {
                         {
                             _ if !self.is_live(vgen) => return Ok(()),
                             Ok(size) => size,
-                            Err(_) => continue,
+                            Err(_) => {
+                                restore_incomplete = true;
+                                continue;
+                            }
                         };
                         if let Some(size) = size {
                             let total_chunks = attachment::chunk_count(size);
                             let kept = match inner.vault.chunks_kept(&cp_peer, &cp_id).await {
                                 _ if !self.is_live(vgen) => return Ok(()),
                                 Ok(n) => u64::from(n),
-                                Err(_) => continue,
+                                Err(_) => {
+                                    restore_incomplete = true;
+                                    continue;
+                                }
                             };
                             u64::from(cp.uploaded) >= total_chunks || kept >= total_chunks
                         } else {
@@ -2000,6 +2043,7 @@ impl<V: VaultStore> Engine<V> {
                             if !self.is_live(vgen) {
                                 return Ok(());
                             }
+                            restore_incomplete = true;
                             continue;
                         }
                         if !self.is_live(vgen) {
@@ -2008,12 +2052,15 @@ impl<V: VaultStore> Engine<V> {
                         orphans_settled = true;
                     }
                 }
-                let _ = inner.vault.forget_upload(&cp_peer, &cp_id).await;
+                if inner.vault.forget_upload(&cp_peer, &cp_id).await.is_err() {
+                    restore_incomplete = true;
+                }
             }
             if orphans_settled && self.is_live(vgen) {
                 self.refresh_contacts(inner);
             }
         }
+        self.uploads.set_restore_needed(restore_incomplete);
         Ok(())
     }
 
@@ -2554,10 +2601,10 @@ impl<V: VaultStore> Engine<V> {
                         if expected_gen.is_some_and(|want| contact.state.conversation_gen != want) {
                             return Err("chat changed; please retry.".to_string());
                         }
-                        // R11-P1-2 + R12-P1-1 + R12-P1-3: Do not silently accept an unquarantined
-                        // classical request (active OR archived in `others` after a cancelled
-                        // crossed start) when local policy requires PQ (`strict_pq`) or ordinary
-                        // local PQ is enabled without an explicit classical exception.
+                        // R11-P1-2 + R12-P1-1 + R12-P1-3 + R17-P1-3: Do not silently accept an
+                        // unquarantined classical request (active OR archived in `others`) when
+                        // local policy blocks classical sessions (`strict_pq`, hard PQ pin or
+                        // downgrade, or ordinary local PQ without an explicit classical exception).
                         if contact.state.request && contact.is_classical_session() {
                             if strict_pq {
                                 return Err(
@@ -2565,12 +2612,11 @@ impl<V: VaultStore> Engine<V> {
                                         .to_string(),
                                 );
                             }
-                            if local_pq_enabled
-                                && !contact.session.peer_pq_state().allow_classical_exception
-                            {
-                                if contact.session.peer_pq_state().pq_pinned {
+                            let peer_pq = contact.session.peer_pq_state();
+                            if local_pq_enabled && classical_policy_blocked(false, true, peer_pq) {
+                                if classical_hard_blocked_by_pin_or_downgrade(peer_pq) {
                                     return Err(
-                                        "Peer is post-quantum pinned; upgrade to PQ or allow classical encryption before accepting this request."
+                                        "Peer is post-quantum pinned; upgrade to post-quantum encryption before accepting this classical request."
                                             .to_string(),
                                     );
                                 }
@@ -2794,6 +2840,14 @@ impl<V: VaultStore> Engine<V> {
                 .collect()
         });
         let running = self.uploads.snapshot_running();
+        // R17-P2-4: Include any announced uploads whose `cancel_upload` failed transiently (so
+        // they were removed from `shown` and stopped, yet still need server-side cancellation
+        // before chat deletion erases the upload token and clears `pending_cancellations`).
+        let pending_cancels: HashSet<[u8; 16]> = self
+            .uploads
+            .pending_cancels_for_peer(&peer)
+            .into_iter()
+            .collect();
         let vault_uploads = inner
             .vault
             .uploads(Some(&peer))
@@ -2806,10 +2860,14 @@ impl<V: VaultStore> Engine<V> {
         let unfinished: Vec<(String, Upload)> = vault_uploads
             .into_iter()
             .filter(|(_, pending)| {
-                let id_running = <[u8; 16]>::try_from(pending.id.as_slice())
-                    .is_ok_and(|id| running.contains(&id));
+                let id_arr = <[u8; 16]>::try_from(pending.id.as_slice()).ok();
+                let id_running = id_arr.is_some_and(|id| running.contains(&id));
+                let id_pending_cancel = id_arr.is_some_and(|id| pending_cancels.contains(&id));
                 pending.started()
-                    && (shown.contains(&pending.id) || id_running || !pending.is_announced())
+                    && (shown.contains(&pending.id)
+                        || id_running
+                        || id_pending_cancel
+                        || !pending.is_announced())
             })
             .filter_map(|(_, pending)| Some((pending.name.clone(), upload_of(&pending).ok()?)))
             .collect();
@@ -3334,7 +3392,9 @@ impl<V: VaultStore> Inner<V> {
     }
 
     /// Locate a history entry carrying attachment `id` (checking `hint_index` first, then scanning
-    /// history backwards in `HISTORY_SHOWN` pages).
+    /// history backwards in `HISTORY_SHOWN` pages). When a page contains an unrelated corrupt row
+    /// (`Error::Corrupt`), falls back to scanning individual entries in that page while still
+    /// propagating transient `Error::Storage` failures (`R17-P2-6`).
     pub(super) async fn find_attachment_entry(
         &self,
         peer: &PublicKey,
@@ -3347,10 +3407,12 @@ impl<V: VaultStore> Inner<V> {
                 Some(Kind::Attachment(pointer)) if pointer.id == id
             )
         };
-        if let Some(index) = hint_index
-            && let Some(entry) = self.vault.entry(peer, index).await?.filter(matches_id)
-        {
-            return Ok(Some((index, entry)));
+        if let Some(index) = hint_index {
+            match self.vault.entry(peer, index).await {
+                Ok(Some(entry)) if matches_id(&entry) => return Ok(Some((index, entry))),
+                Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
         let mut end = self
             .contacts
@@ -3358,11 +3420,26 @@ impl<V: VaultStore> Inner<V> {
             .find(|contact| contact.peer == *peer)
             .map_or(0, |contact| contact.state.history_len);
         while end > 0 {
-            let page = self.vault.history(peer, end, HISTORY_SHOWN).await?;
-            if let Some(found) = page.into_iter().rev().find(|(_, entry)| matches_id(entry)) {
-                return Ok(Some(found));
+            let start = end.saturating_sub(HISTORY_SHOWN);
+            match self.vault.history(peer, end, HISTORY_SHOWN).await {
+                Ok(page) => {
+                    if let Some(found) = page.into_iter().rev().find(|(_, entry)| matches_id(entry))
+                    {
+                        return Ok(Some(found));
+                    }
+                }
+                Err(crate::vault::Error::Corrupt(_)) => {
+                    for idx in (start..end).rev() {
+                        match self.vault.entry(peer, idx).await {
+                            Ok(Some(entry)) if matches_id(&entry) => return Ok(Some((idx, entry))),
+                            Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
             }
-            end = end.saturating_sub(HISTORY_SHOWN);
+            end = start;
         }
         Ok(None)
     }

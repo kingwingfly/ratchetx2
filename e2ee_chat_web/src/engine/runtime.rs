@@ -109,6 +109,10 @@ impl UploadRegistry {
         self.cancelled.borrow().contains(id)
     }
 
+    pub(super) fn has_any_cancelled(&self) -> bool {
+        !self.cancelled.borrow().is_empty()
+    }
+
     pub(super) fn mark_cancelled(&self, id: [u8; 16]) {
         self.cancelled.borrow_mut().insert(id);
     }

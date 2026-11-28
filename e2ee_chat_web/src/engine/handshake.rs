@@ -3537,27 +3537,25 @@ impl<V: VaultStore> Engine<V> {
                 let cur_request = inner.contacts[index].state.request;
                 let cur_provisional = inner.contacts[index].state.provisional;
                 let cur_quarantined = inner.contacts[index].state.quarantined;
-                // R11-P1-2 + R12-P1-1 + R12-P1-2 + R12-P1-3: Never stage grants for or accept an
-                // unquarantined classical request (active OR archived in `others`) when local
-                // policy requires PQ (`strict_pq`), a fresh `pin_pq` invitation supersedes any
-                // prior classical exception, or ordinary local PQ requires explicit classical
-                // approval (`ClassicalApprovalRequired`).
-                let pq_block_err = if cur_request
+                // R11-P1-2 + R12-P1-1 + R12-P1-2 + R12-P1-3 + R17-P1-2 + R17-P1-3: Never stage
+                // grants for or accept/resume an unquarantined classical request OR rolled-back
+                // provisional contact (active OR archived in `others`) when local policy requires
+                // PQ (`strict_pq`), a fresh `pin_pq` invitation or hard PQ pin/downgrade applies,
+                // or ordinary local PQ requires explicit classical approval.
+                let pq_block_err = if (cur_request || cur_provisional)
                     && !cur_quarantined
                     && inner.contacts[index].is_classical_session()
                 {
-                    if inner.client.pq_config().strict_pq {
+                    let strict_pq = inner.client.pq_config().strict_pq;
+                    let local_pq = inner.local_pq_enabled();
+                    let peer_pq = inner.contacts[index].session.peer_pq_state();
+                    if strict_pq {
                         Some(StartChatError::PqRequired)
-                    } else if inner.local_pq_enabled() && !allow_classical {
-                        let peer_pq = inner.contacts[index].session.peer_pq_state();
-                        if pin_pq {
+                    } else if local_pq {
+                        if pin_pq || super::classical_hard_blocked_by_pin_or_downgrade(peer_pq) {
                             Some(StartChatError::DowngradeDetected)
-                        } else if !peer_pq.allow_classical_exception {
-                            if peer_pq.pq_pinned {
-                                Some(StartChatError::DowngradeDetected)
-                            } else {
-                                Some(StartChatError::ExistingClassicalRequestApprovalRequired)
-                            }
+                        } else if !allow_classical && !peer_pq.allow_classical_exception {
+                            Some(StartChatError::ExistingClassicalRequestApprovalRequired)
                         } else {
                             None
                         }
@@ -3569,6 +3567,7 @@ impl<V: VaultStore> Engine<V> {
                 };
                 if let Some(block_err) = pq_block_err {
                     let mut dirty = false;
+                    let was_unrequested_provisional = cur_provisional && !cur_request;
                     // R13-P2-2: Persist a fresh `pin_pq` invitation pin (clearing any stale
                     // `allow_classical_exception`) under BOTH `DowngradeDetected` AND `PqRequired`.
                     if pin_pq
@@ -3585,7 +3584,28 @@ impl<V: VaultStore> Engine<V> {
                         }
                         dirty = true;
                     }
-                    if flushed_grants || marked_provisional_for_accept {
+                    if was_unrequested_provisional {
+                        // R17-P1-2: Convert a blocked provisional classical start (e.g. after
+                        // `R16-P2-2` rollback) into an explicit unaccepted request and revoke
+                        // its provisional relay grant.
+                        let c = &mut inner.contacts[index];
+                        c.state.provisional = false;
+                        c.state.request = true;
+                        c.session.clear_pending_grants();
+                        c.session.prune_classical_earlier();
+                        match block_err {
+                            StartChatError::PqRequired => {
+                                c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                            }
+                            StartChatError::DowngradeDetected => {
+                                c.session.peer_pq_state_mut().downgrade_detected = true;
+                                c.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                            }
+                            _ => {}
+                        }
+                        stage_revoke(inner);
+                        dirty = true;
+                    } else if flushed_grants || marked_provisional_for_accept {
                         let c = &mut inner.contacts[index];
                         if marked_provisional_for_accept {
                             c.state.provisional = false;
@@ -3607,8 +3627,11 @@ impl<V: VaultStore> Engine<V> {
                     }
                     self.startup.end_new_chat_submit(submission_id);
                     drop(guard);
+                    if flushed_grants || was_unrequested_provisional {
+                        let _ = self.flush_pending_revoke_for_peer(vgen, &peer).await;
+                    }
                     drop(peer_guard);
-                    if flushed_grants && self.is_live(vgen) {
+                    if (flushed_grants || was_unrequested_provisional) && self.is_live(vgen) {
                         self.wake();
                     }
                     return Err(block_err);
@@ -3642,13 +3665,10 @@ impl<V: VaultStore> Engine<V> {
                         .earlier_inbound_token_hashes_for_policy(allow_earlier_classical)
                         .filter(|h| Some(*h) != active_token)
                         .collect();
-                    let need_active = active_token.filter(|t| {
-                        !staged_tokens.contains(t)
-                            && (cur_will_accept
-                                || pass > 0
-                                || (!inner.contacts[index].session.has_pending_active_grant()
-                                    && !inner.contacts[index].session.is_known_by_peer()))
-                    });
+                    // R17-P1-2: Stage `active_token` on `pass == 0` for `cur_will_resume` even
+                    // when `is_known_by_peer() == true` (e.g. a rolled-back crossed-start winner
+                    // whose token was suppressed while provisional).
+                    let need_active = active_token.filter(|t| !staged_tokens.contains(t));
                     let need_earlier: Vec<[u8; 32]> = earlier_tokens
                         .into_iter()
                         .filter(|t| !staged_tokens.contains(t))
@@ -3878,34 +3898,36 @@ impl<V: VaultStore> Engine<V> {
             let was_request = inner.contacts[index].state.request;
             let was_provisional = inner.contacts[index].state.provisional;
             let quarantined = inner.contacts[index].state.quarantined;
-            // R11-P1-2 + R12-P1-1 + R12-P1-2 + R12-P1-3: Re-check classical request PQ policy
-            // under Phase B's `guard` (in case `strict_pq`, `pq_enabled`, or peer session changed
-            // while Phase A awaited `RegisterWriteToken`).
-            let phase_b_pq_block =
-                if was_request && !quarantined && inner.contacts[index].is_classical_session() {
-                    if inner.client.pq_config().strict_pq {
-                        Some(StartChatError::PqRequired)
-                    } else if inner.local_pq_enabled() && !allow_classical {
-                        let peer_pq = inner.contacts[index].session.peer_pq_state();
-                        if pin_pq {
-                            Some(StartChatError::DowngradeDetected)
-                        } else if !peer_pq.allow_classical_exception {
-                            if peer_pq.pq_pinned {
-                                Some(StartChatError::DowngradeDetected)
-                            } else {
-                                Some(StartChatError::ExistingClassicalRequestApprovalRequired)
-                            }
-                        } else {
-                            None
-                        }
+            // R11-P1-2 + R12-P1-1 + R12-P1-2 + R12-P1-3 + R17-P1-2 + R17-P1-3: Re-check classical
+            // request AND provisional-resume PQ policy under Phase B's `guard` (in case
+            // `strict_pq`, `pq_enabled`, or peer session changed while Phase A awaited
+            // `RegisterWriteToken`).
+            let phase_b_pq_block = if (was_request || was_provisional)
+                && !quarantined
+                && inner.contacts[index].is_classical_session()
+            {
+                let strict_pq = inner.client.pq_config().strict_pq;
+                let local_pq = inner.local_pq_enabled();
+                let peer_pq = inner.contacts[index].session.peer_pq_state();
+                if strict_pq {
+                    Some(StartChatError::PqRequired)
+                } else if local_pq {
+                    if pin_pq || super::classical_hard_blocked_by_pin_or_downgrade(peer_pq) {
+                        Some(StartChatError::DowngradeDetected)
+                    } else if !allow_classical && !peer_pq.allow_classical_exception {
+                        Some(StartChatError::ExistingClassicalRequestApprovalRequired)
                     } else {
                         None
                     }
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
             if let Some(block_err) = phase_b_pq_block {
                 let mut dirty = false;
+                let was_unrequested_provisional = was_provisional && !was_request;
                 if pin_pq
                     && matches!(
                         block_err,
@@ -3920,7 +3942,25 @@ impl<V: VaultStore> Engine<V> {
                     }
                     dirty = true;
                 }
-                if flushed_grants || marked_provisional_for_accept {
+                if was_unrequested_provisional {
+                    let c = &mut inner.contacts[index];
+                    c.state.provisional = false;
+                    c.state.request = true;
+                    c.session.clear_pending_grants();
+                    c.session.prune_classical_earlier();
+                    match block_err {
+                        StartChatError::PqRequired => {
+                            c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                        }
+                        StartChatError::DowngradeDetected => {
+                            c.session.peer_pq_state_mut().downgrade_detected = true;
+                            c.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                        }
+                        _ => {}
+                    }
+                    stage_revoke(inner);
+                    dirty = true;
+                } else if flushed_grants || marked_provisional_for_accept {
                     let c = &mut inner.contacts[index];
                     if marked_provisional_for_accept {
                         c.state.provisional = false;
@@ -3942,8 +3982,11 @@ impl<V: VaultStore> Engine<V> {
                 }
                 self.startup.end_new_chat_submit(submission_id);
                 drop(guard);
+                if flushed_grants || was_unrequested_provisional {
+                    let _ = self.flush_pending_revoke_for_peer(vgen, &peer).await;
+                }
                 drop(peer_guard);
-                if flushed_grants && self.is_live(vgen) {
+                if (flushed_grants || was_unrequested_provisional) && self.is_live(vgen) {
                     self.wake();
                 }
                 return Err(block_err);
@@ -4230,6 +4273,25 @@ impl<V: VaultStore> Engine<V> {
         }
         if (accepted_now || resumed_provisional || revoked_in_phase_b) && self.is_live(vgen) {
             self.wake();
+        }
+        // R17-P2-1: Re-verify `initial_conv_gen` before returning `Ok(peer)` so a concurrent
+        // `delete_for_gen` (+ replacement inbound request) during post-Phase-B grant/outbox
+        // flushes cannot navigate the dialog into a different conversation incarnation.
+        if phase_b_extra_grants || accepted_now {
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err(StartChatError::Cancelled);
+            }
+            let still_same_chat = guard.as_ref().is_some_and(|inner| {
+                inner
+                    .contacts
+                    .iter()
+                    .any(|c| c.peer == peer && c.state.conversation_gen == initial_conv_gen)
+            });
+            drop(guard);
+            if !still_same_chat {
+                return Err(StartChatError::Cancelled);
+            }
         }
         Ok(peer)
     }
@@ -4775,16 +4837,37 @@ impl<V: VaultStore> Engine<V> {
                             if !self.is_live(vgen) {
                                 return Err(StartChatError::Cancelled);
                             }
-                            // R16-P2-2: On the allowed-winner acceptance path, require acceptance
-                            // and staged grants to commit durably BEFORE issuing
+                            // R16-P2-2 + R17-P2-2: On the allowed-winner acceptance path, require
+                            // acceptance and staged grants to commit durably BEFORE issuing
                             // `RegisterWriteToken` or returning `Ok(peer)` so a reload cannot
-                            // revert the provisional contact and revoke the registered token.
+                            // revert the provisional contact and revoke the registered token. If
+                            // New Chat was dismissed while `save_state().await` was pending, run
+                            // the cancellation handler immediately after rolling back.
                             if crossed_winner_blocked_err.is_none() {
                                 if let Some(snapshot) = prev_contact {
                                     let _ = inner.roll_back(&peer, snapshot);
                                 }
                                 inner.state.pending_revokes = prev_pending_revokes;
                                 self.startup.end_new_chat_submit(submission_id);
+                                if self.is_submission_cancelled(submission_id) {
+                                    let live = self
+                                        .handle_cancelled_start_chat_locked(
+                                            vgen,
+                                            inner,
+                                            &peer,
+                                            created_conv_gen,
+                                            created_session_id.as_ref(),
+                                            &retained_farewells,
+                                            true,
+                                        )
+                                        .await;
+                                    drop(guard);
+                                    drop(peer_guard);
+                                    if live {
+                                        self.wake();
+                                    }
+                                    return Err(StartChatError::Cancelled);
+                                }
                                 self.refresh_contacts(inner);
                                 drop(guard);
                                 drop(peer_guard);
@@ -4857,12 +4940,35 @@ impl<V: VaultStore> Engine<V> {
                             }
                             return Err(StartChatError::Cancelled);
                         }
-                        // R16-P2-3: Re-verify `created_conv_gen` after awaiting the winning-grant
-                        // RPC so a concurrent `delete_for_gen` (+ replacement inbound request)
-                        // cannot cause `start_chat` to return `Ok(peer)` for a deleted chat.
+                        // R16-P2-3 + R17-P2-2: Re-verify cancellation AND `created_conv_gen`
+                        // under the acquired guard after awaiting the winning-grant RPC so a
+                        // dismissal while waiting for `lock_inner()` or a concurrent
+                        // `delete_for_gen` (+ replacement request) cannot return `Ok(peer)`.
                         if crossed_winner_blocked_err.is_none() {
-                            let guard = self.lock_inner().await;
+                            let mut guard = self.lock_inner().await;
                             if !self.is_live(vgen) {
+                                return Err(StartChatError::Cancelled);
+                            }
+                            if self.is_submission_cancelled(submission_id) {
+                                self.startup.end_new_chat_submit(submission_id);
+                                if let Some(inner) = guard.as_mut() {
+                                    let _ = self
+                                        .handle_cancelled_start_chat_locked(
+                                            vgen,
+                                            inner,
+                                            &peer,
+                                            created_conv_gen,
+                                            created_session_id.as_ref(),
+                                            &retained_farewells,
+                                            true,
+                                        )
+                                        .await;
+                                }
+                                drop(guard);
+                                drop(peer_guard);
+                                if self.is_live(vgen) {
+                                    self.wake();
+                                }
                                 return Err(StartChatError::Cancelled);
                             }
                             let still_same_chat = guard.as_ref().is_some_and(|inner| {
@@ -5069,11 +5175,12 @@ impl<V: VaultStore> Engine<V> {
                 return Err(StartChatError::Cancelled);
             }
         }
-        // R7-P1-3 + R8-P1-1 + R8-P2-4 + R9-P1-4 + R9-P2-2: Re-check cancellation after
+        // R7-P1-3 + R8-P1-1 + R8-P2-4 + R9-P1-4 + R9-P2-2 + R17-P2-1: Re-check cancellation after
         // `flush_extra_grants` (or after a failed save) AND revalidate conversation generation /
-        // active session / request / quarantine state after `flush_extra_grants` so neither a
-        // cancelled start nor a superseded/quarantined outbound session can transmit `SendInitialV2`.
-        if self.is_submission_cancelled(submission_id) || (flush_extra_grants && ready_to_send) {
+        // active session / request / quarantine state whenever `flush_extra_grants` awaited a
+        // network RPC (including when `!ready_to_send`) so neither a cancelled start nor a
+        // deleted/replaced/superseded/quarantined outbound session returns `Ok(peer)` or sends.
+        if self.is_submission_cancelled(submission_id) || flush_extra_grants {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
@@ -5100,6 +5207,20 @@ impl<V: VaultStore> Engine<V> {
                 return Err(StartChatError::Cancelled);
             }
             if let Some(inner) = guard.as_mut() {
+                if !ready_to_send {
+                    let still_same_chat = inner
+                        .contacts
+                        .iter()
+                        .any(|c| c.peer == peer && c.state.conversation_gen == created_conv_gen);
+                    drop(guard);
+                    drop(peer_guard);
+                    if !still_same_chat {
+                        self.startup.end_new_chat_submit(submission_id);
+                        return Err(StartChatError::Cancelled);
+                    }
+                    self.wake();
+                    return Ok(peer);
+                }
                 let outgoing_is_pq = outgoing_request
                     .message
                     .as_ref()
@@ -5224,7 +5345,13 @@ impl<V: VaultStore> Engine<V> {
         let Some(inner) = guard.as_mut() else {
             return Err(StartChatError::Cancelled);
         };
-        let contact_exists = inner.contacts.iter().any(|c| c.peer == peer);
+        // R17-P2-1: Pin Phase-4 existence strictly to `created_conv_gen` so a concurrent
+        // `delete_for_gen` + fresh inbound request cannot make `start_chat` return `Ok(peer)` or
+        // open `SignInDialog` for a deleted chat.
+        let contact_exists = inner
+            .contacts
+            .iter()
+            .any(|c| c.peer == peer && c.state.conversation_gen == created_conv_gen);
         let matches_session = inner
             .contacts
             .iter()

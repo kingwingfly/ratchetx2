@@ -594,12 +594,6 @@ impl<V: VaultStore> Engine<V> {
             upload_state: UPLOAD_STATE_WAITING,
             sealed_chunk_hash: Vec::new(),
         };
-        // Kept first, so that no message waits for an upload that is not kept.
-        inner
-            .vault
-            .save_upload(&peer, &waiting)
-            .await
-            .map_err(|e| describe(&e))?;
         let pointer = AttachmentPointer {
             id: vec![],
             key: vec![],
@@ -608,13 +602,10 @@ impl<V: VaultStore> Engine<V> {
             mime: waiting.mime.clone(),
             expires: 0,
         };
-        let view = match inner.add(&peer, Kind::Attachment(pointer), true).await {
-            Ok(view) => view,
-            Err(e) => {
-                let _ = inner.vault.forget_upload(&peer, &id).await;
-                return Err(e);
-            }
-        };
+        // R17-P2-7: Persist `waiting` checkpoint + placeholder `HistoryEntry` + `OutgoingRecord` +
+        // `Outgoing { awaits_upload: true, attachment_id: waiting.id }` in ONE atomic transaction
+        // so a storage failure can never leave two waiting uploads claiming the same index.
+        let view = inner.add_waiting_upload(&peer, pointer, &waiting).await?;
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
@@ -691,6 +682,8 @@ impl<V: VaultStore> Engine<V> {
                                             && c.state.outbox.iter().any(|o| {
                                                 o.history_index == p.history_index
                                                     && o.awaits_upload
+                                                    && (o.attachment_id.is_empty()
+                                                        || o.attachment_id == p.id)
                                             })
                                     })
                             })
@@ -1442,11 +1435,11 @@ impl<V: VaultStore> Engine<V> {
         // promoted the message must only be forgotten, without failing the active message).
         if let Some(waiting) = pending.as_ref().filter(|pending| !pending.started()) {
             let still_awaits = inner.contact(peer).is_some_and(|contact| {
-                contact
-                    .state
-                    .outbox
-                    .iter()
-                    .any(|o| o.history_index == waiting.history_index && o.awaits_upload)
+                contact.state.outbox.iter().any(|o| {
+                    o.history_index == waiting.history_index
+                        && o.awaits_upload
+                        && (o.attachment_id.is_empty() || o.attachment_id == waiting.id)
+                })
             });
             if still_awaits {
                 self.fail_waiting(inner, peer, waiting.history_index)
@@ -1477,36 +1470,34 @@ impl<V: VaultStore> Engine<V> {
                 .into_iter()
                 .find(|cp| cp.id.as_slice() == id.as_slice());
             let Some(cp) = orphan_cp else {
-                // R15-P2-8 + R16-P2-8: If `run_upload` finished `forget_upload` while Cancel was
-                // waiting for `self.inner`, neither `PendingUpload` nor its checkpoint remains, yet
-                // the completed file may still be downloadable on the server. Locate its outgoing
-                // pointer in history (propagating transient storage errors), fail any still-
-                // un-dispatched outbox item, and schedule `DeleteCompleted` using its delete key.
+                // R15-P2-8 + R16-P2-8 + R17-P2-6: If `run_upload` finished `forget_upload` while
+                // Cancel was waiting for `self.inner`, neither `PendingUpload` nor its checkpoint
+                // remains, yet the completed file may still be downloadable on the server. Locate
+                // its outgoing pointer in history (scanning around unrelated corrupt rows) or a
+                // surviving unsealed `OutgoingRecord`, fail any un-dispatched outbox item, and
+                // schedule `DeleteCompleted` using its delete key.
                 let mut delete_jobs = Vec::new();
                 let mut should_flush = false;
-                match inner.find_attachment_entry(peer, None, &id).await {
+                let mut outbox_match = inner.contact(peer).and_then(|c| {
+                    c.state
+                        .outbox
+                        .iter()
+                        .find(|o| o.attachment_id.as_slice() == id.as_slice())
+                        .map(|o| (o.history_index, o.dispatched, o.sealed))
+                });
+                let hint_idx = outbox_match.map(|(idx, _, _)| idx);
+                match inner.find_attachment_entry(peer, hint_idx, &id).await {
                     _ if !self.is_live(vgen) => return Err("locked".into()),
                     Ok(Some((idx, entry))) if entry.outgoing => {
-                        let outbox_state = inner.contact(peer).and_then(|contact| {
-                            contact
-                                .state
-                                .outbox
-                                .iter()
-                                .find(|o| o.history_index == idx)
-                                .map(|o| o.dispatched)
-                        });
-                        match outbox_state {
-                            Some(false) => {
-                                self.fail_waiting(inner, peer, idx).await?;
-                                if !self.is_live(vgen) {
-                                    return Err("locked".into());
-                                }
-                                should_flush = true;
-                            }
-                            Some(true) => {
-                                should_flush = true;
-                            }
-                            None => {}
+                        if outbox_match.is_none() {
+                            outbox_match = inner.contact(peer).and_then(|contact| {
+                                contact
+                                    .state
+                                    .outbox
+                                    .iter()
+                                    .find(|o| o.history_index == idx)
+                                    .map(|o| (o.history_index, o.dispatched, o.sealed))
+                            });
                         }
                         if !entry.gone
                             && let Some(Kind::Attachment(ptr)) =
@@ -1525,21 +1516,54 @@ impl<V: VaultStore> Engine<V> {
                     Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
                     Err(e) => return Err(describe(&e)),
                 }
+                if delete_jobs.is_empty()
+                    && let Some((idx, _, false)) = outbox_match
+                {
+                    match inner.vault.outgoing(peer, idx).await {
+                        _ if !self.is_live(vgen) => return Err("locked".into()),
+                        Ok(rec) => {
+                            if let Some(Kind::Attachment(ptr)) = Kind::from_bytes(&rec.content)
+                                && ptr.id.as_slice() == id.as_slice()
+                                && let Ok(key) = <[u8; 32]>::try_from(ptr.key.as_slice())
+                            {
+                                delete_jobs.push(ServerDeleteJob {
+                                    server: inner.server.clone(),
+                                    id,
+                                    history_index: Some(idx),
+                                    name: ptr.name.clone(),
+                                    kind: ServerDeleteKind::DeleteCompleted(key.into()),
+                                });
+                            }
+                        }
+                        Err(crate::vault::Error::Corrupt(_)) => {}
+                        Err(e) => return Err(describe(&e)),
+                    }
+                }
+                if let Some((idx, dispatched, _)) = outbox_match {
+                    if !dispatched {
+                        self.fail_waiting(inner, peer, idx).await?;
+                        if !self.is_live(vgen) {
+                            return Err("locked".into());
+                        }
+                    }
+                    should_flush = true;
+                }
                 return Ok((delete_jobs, should_flush));
             };
-            // R16-P2-7 + R16-P2-8: Match `WAITING` / `ANNOUNCED` checkpoints at every valid index
-            // (including index `0`) and resolve the outgoing pointer delete key so already-uploaded
-            // R2 chunks are deleted via `DeleteCompleted` even when `PendingUpload` is corrupt.
+            // R16-P2-7 + R16-P2-8 + R17-P2-6: Match `WAITING` / `ANNOUNCED` checkpoints at every
+            // valid index (including index `0`) and resolve the outgoing pointer delete key from
+            // history or a surviving unsealed `OutgoingRecord` so already-uploaded R2 chunks are
+            // deleted via `DeleteCompleted` even when `PendingUpload` or history is corrupt.
             let mut outbox_match = inner.contact(peer).and_then(|c| {
                 c.state
                     .outbox
                     .iter()
                     .find(|o| super::checkpoint_matches_outbox(&cp, &id, o))
-                    .map(|o| (o.history_index, o.dispatched))
+                    .map(|o| (o.history_index, o.dispatched, o.sealed))
             });
             let hint_idx = (cp.upload_state == crate::vault::UPLOAD_STATE_ANNOUNCED)
                 .then_some(cp.history_index)
-                .or_else(|| outbox_match.map(|(idx, _)| idx));
+                .or_else(|| outbox_match.map(|(idx, _, _)| idx));
             let mut delete_jobs = Vec::new();
             match inner.find_attachment_entry(peer, hint_idx, &id).await {
                 _ if !self.is_live(vgen) => return Err("locked".into()),
@@ -1550,7 +1574,7 @@ impl<V: VaultStore> Engine<V> {
                                 .outbox
                                 .iter()
                                 .find(|o| o.history_index == idx)
-                                .map(|o| (o.history_index, o.dispatched))
+                                .map(|o| (o.history_index, o.dispatched, o.sealed))
                         });
                     }
                     if !entry.gone
@@ -1570,8 +1594,31 @@ impl<V: VaultStore> Engine<V> {
                 Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
                 Err(e) => return Err(describe(&e)),
             }
+            if delete_jobs.is_empty()
+                && let Some((idx, _, false)) = outbox_match
+            {
+                match inner.vault.outgoing(peer, idx).await {
+                    _ if !self.is_live(vgen) => return Err("locked".into()),
+                    Ok(rec) => {
+                        if let Some(Kind::Attachment(ptr)) = Kind::from_bytes(&rec.content)
+                            && ptr.id.as_slice() == id.as_slice()
+                            && let Ok(key) = <[u8; 32]>::try_from(ptr.key.as_slice())
+                        {
+                            delete_jobs.push(ServerDeleteJob {
+                                server: inner.server.clone(),
+                                id,
+                                history_index: Some(idx),
+                                name: ptr.name.clone(),
+                                kind: ServerDeleteKind::DeleteCompleted(key.into()),
+                            });
+                        }
+                    }
+                    Err(crate::vault::Error::Corrupt(_)) => {}
+                    Err(e) => return Err(describe(&e)),
+                }
+            }
             let mut should_flush = false;
-            if let Some((idx, dispatched)) = outbox_match {
+            if let Some((idx, dispatched, _)) = outbox_match {
                 if !dispatched {
                     self.fail_waiting(inner, peer, idx).await?;
                     if !self.is_live(vgen) {
@@ -1591,7 +1638,21 @@ impl<V: VaultStore> Engine<V> {
             return Ok((delete_jobs, should_flush));
         };
         let upload = upload_of(&pending)?;
-        let mut announced_index = pending.is_announced().then_some(pending.history_index);
+        // R17-P2-5: Match `Outgoing.attachment_id` as well as `pending.is_announced()` so a
+        // valid `STARTED` upload whose `ANNOUNCED` save failed AND whose `HistoryEntry` is
+        // missing/corrupt still settles its un-dispatched outbox head before forgetting.
+        let mut announced_index = pending
+            .is_announced()
+            .then_some(pending.history_index)
+            .or_else(|| {
+                inner.contact(peer).and_then(|c| {
+                    c.state
+                        .outbox
+                        .iter()
+                        .find(|o| o.attachment_id.as_slice() == id.as_slice())
+                        .map(|o| o.history_index)
+                })
+            });
         if announced_index.is_none() {
             match inner.find_attachment_entry(peer, None, &id).await {
                 _ if !self.is_live(vgen) => return Err("locked".into()),

@@ -774,6 +774,8 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                             && pq_available(ui)
                             && c.request
                             && !c.allow_classical_exception
+                            && !c.has_downgrade()
+                            && !(c.pq_pinned && c.peer_pq_capable)
                             && ((!c.has_active_session && c.has_classical_earlier)
                                 || (c.has_active_session && !c.security.is_pq)));
                     let show_upgrade = pq_available(ui) && contact_can_upgrade_to_pq(&c);
