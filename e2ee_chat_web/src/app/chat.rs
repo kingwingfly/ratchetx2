@@ -302,17 +302,23 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                             .into_any(),
                         )
                     }
-                    ClassicalPrompt::Outbound => Some(
-                        view! {
-                            <div class="banner warn" role="alert">
-                                <span>
-                                    "Sending paused: this peer published a signed manifest disabling post-quantum encryption. "
-                                    {if strict_pq {
-                                        "Require post-quantum (strict mode) blocks classical fallback. Retry PQ when available or disable strict mode in Settings."
-                                    } else {
-                                        "Allow classical fallback to send?"
-                                    }}
-                                </span>
+                    ClassicalPrompt::Outbound | ClassicalPrompt::ServerPqDisabled => {
+                        let lead = if c.classical_prompt == ClassicalPrompt::ServerPqDisabled {
+                            "Sending paused: this server currently has post-quantum encryption disabled. "
+                        } else {
+                            "Sending paused: this peer published a signed manifest disabling post-quantum encryption. "
+                        };
+                        Some(
+                            view! {
+                                <div class="banner warn" role="alert">
+                                    <span>
+                                        {lead}
+                                        {if strict_pq {
+                                            "Require post-quantum (strict mode) blocks classical fallback. Retry PQ when available or disable strict mode in Settings."
+                                        } else {
+                                            "Allow classical fallback to send?"
+                                        }}
+                                    </span>
                                 {move || {
                                     let show_retry = pq_retry_ready(ui);
                                     let conv_gen = c.conversation_gen;
@@ -353,7 +359,8 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                             </div>
                         }
                         .into_any(),
-                    ),
+                    )
+                    }
                     ClassicalPrompt::None => None,
                 }
             }}

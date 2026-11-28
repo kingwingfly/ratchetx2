@@ -12,10 +12,11 @@ use crate::state::{Delivery, MessageView, Step, Ui};
 use crate::transport::Fetch;
 use crate::util::{describe, now, short};
 use crate::vault::{
-    Awaiting, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF, ContactState,
-    GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT,
-    HistoryEntry, Outgoing, OutgoingRecord, SECURITY_ALERT_DOWNGRADE,
-    SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED, SealedEvents,
+    Awaiting, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SERVER_PQ_DISABLED,
+    CLASSICAL_APPROVAL_SIGNED_OFF, ContactState, GREETING_DELIVERY_CONFIRMED,
+    GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, Outgoing, OutgoingRecord,
+    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
+    SECURITY_ALERT_PQ_REQUIRED, SealedEvents,
 };
 use bytes::Bytes;
 use leptos::prelude::*;
@@ -374,11 +375,13 @@ impl<V: VaultStore> Engine<V> {
                                             matched_att_id = Some(att_id);
                                         }
                                     }
-                                    Ok(None) => {
-                                        // R14-P2-2: Missing `HistoryEntry` must not bypass the
-                                        // zero-chunk guard when an independent unsealed
-                                        // `OutgoingRecord` or matching checkpoint identifies the
-                                        // attachment.
+                                    Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {
+                                        // R14-P2-2 + R15-P2-9: Missing OR corrupt `HistoryEntry`
+                                        // must neither bypass the zero-chunk guard for an
+                                        // attachment nor block an unrelated intact text message
+                                        // ahead of a paused attachment. Inspect the independent
+                                        // unsealed `OutgoingRecord` and authenticated checkpoint
+                                        // index to identify whether this head is the attachment.
                                         if !outgoing.sealed {
                                             match inner
                                                 .vault
@@ -442,6 +445,48 @@ impl<V: VaultStore> Engine<V> {
                                             return Ok(false);
                                         }
                                         if orphan {
+                                            // R15-P2-6: Before failing an orphaned 0-chunk head,
+                                            // check `chunks_kept` against the attachment's declared
+                                            // size (since `cp.uploaded` is saved before PUTting
+                                            // each chunk). If already complete, only forget the
+                                            // stale checkpoint and continue pushing.
+                                            let is_complete = if let Some(size) = inner
+                                                .attachment_size_for_outbox(
+                                                    peer,
+                                                    outgoing.history_index,
+                                                    &att_id,
+                                                    outgoing.sealed,
+                                                )
+                                                .await
+                                            {
+                                                if !self.is_live(vgen) {
+                                                    return Ok(false);
+                                                }
+                                                let total_chunks =
+                                                    session::attachment::chunk_count(size);
+                                                let kept = u64::from(
+                                                    inner
+                                                        .vault
+                                                        .chunks_kept(peer, &att_id)
+                                                        .await
+                                                        .unwrap_or(0),
+                                                );
+                                                if !self.is_live(vgen) {
+                                                    return Ok(false);
+                                                }
+                                                kept >= total_chunks
+                                            } else {
+                                                false
+                                            };
+                                            if is_complete {
+                                                let _ =
+                                                    inner.vault.forget_upload(peer, &att_id).await;
+                                                if !self.is_live(vgen) {
+                                                    return Ok(false);
+                                                }
+                                                changed = true;
+                                                continue;
+                                            }
                                             match self
                                                 .fail_waiting(inner, peer, outgoing.history_index)
                                                 .await
@@ -718,6 +763,47 @@ impl<V: VaultStore> Engine<V> {
                                 )
                         });
                         if blocked {
+                            // R15-P1-2: If this sealed record was ALREADY dispatched on a
+                            // superseded classical session before a PQ upgrade, settle it cleanly
+                            // via `Step::Unknown` instead of permanently wedging the upgraded PQ
+                            // session's subsequent messages behind it.
+                            let session_matches = inner.contacts.iter().any(|c| {
+                                c.peer == *peer
+                                    && if record.session_id.is_empty() {
+                                        !c.session.security().is_some_and(|s| s.is_pq)
+                                    } else {
+                                        c.session.active_id().is_some_and(|id| {
+                                            id.as_slice() == record.session_id.as_slice()
+                                        })
+                                    }
+                            });
+                            if outgoing.dispatched && !session_matches {
+                                match self
+                                    .commit_outbox_item(
+                                        vgen,
+                                        inner,
+                                        peer,
+                                        &outgoing,
+                                        Step::Unknown,
+                                        outgoing.clock,
+                                        false,
+                                        &mut server_deletes,
+                                    )
+                                    .await
+                                {
+                                    Ok(CommitOutcome::Committed) => {
+                                        self.release(peer, outgoing.history_index);
+                                        changed = true;
+                                        continue;
+                                    }
+                                    Ok(CommitOutcome::Aborted) => return Ok(false),
+                                    Err(e) => {
+                                        result = Err(e);
+                                        step = NextPush::Done;
+                                        break;
+                                    }
+                                }
+                            }
                             if strict_pq
                                 && let Some(c) = inner.contact(peer)
                                 && c.state.security_alert != SECURITY_ALERT_PQ_REQUIRED
@@ -1871,6 +1957,13 @@ impl<V: VaultStore> Engine<V> {
         }
         let paused = match kind {
             ErrorKind::ClassicalApprovalRequired => {
+                let server_disabled = error.is_server_pq_disabled_approval();
+                if server_disabled {
+                    inner.set_server_pq(crate::state::ServerPqStatus::Disabled);
+                    if self.is_live(vgen) {
+                        self.ui.me.set(Some(inner.me()));
+                    }
+                }
                 if let Some(contact) = inner.contact(peer) {
                     if matches!(
                         contact.state.security_alert,
@@ -1878,7 +1971,11 @@ impl<V: VaultStore> Engine<V> {
                     ) {
                         contact.state.security_alert = SECURITY_ALERT_NONE;
                     }
-                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_SIGNED_OFF;
+                    contact.state.classical_approval_needed = if server_disabled {
+                        CLASSICAL_APPROVAL_SERVER_PQ_DISABLED
+                    } else {
+                        CLASSICAL_APPROVAL_SIGNED_OFF
+                    };
                 }
                 true
             }

@@ -11,10 +11,11 @@ use crate::state::{
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, now, sanitize_filename, sanitize_preview_text, short};
 use crate::vault::{
-    Awaiting, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF, ContactState,
-    GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT,
-    HistoryEntry, IndexRange, LastMessageRecord, SECURITY_ALERT_DOWNGRADE,
-    SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
+    Awaiting, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SERVER_PQ_DISABLED,
+    CLASSICAL_APPROVAL_SIGNED_OFF, ContactState, GREETING_DELIVERY_CONFIRMED,
+    GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, IndexRange,
+    LastMessageRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED,
+    SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
 };
 use crate::{content, preview};
 use session::{ErrorKind, PublicKey, Session, SessionState, proto};
@@ -429,6 +430,7 @@ impl Contact {
         } else {
             match self.state.classical_approval_needed {
                 CLASSICAL_APPROVAL_SIGNED_OFF => ClassicalPrompt::Outbound,
+                CLASSICAL_APPROVAL_SERVER_PQ_DISABLED => ClassicalPrompt::ServerPqDisabled,
                 _ => ClassicalPrompt::None,
             }
         };

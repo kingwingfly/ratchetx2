@@ -390,7 +390,7 @@ impl<V: VaultStore> Engine<V> {
     /// (waiting for any in-flight `flush_pending_revokes` call to finish first). Must complete
     /// before sending `RegisterWriteToken` for `peer` so a delayed cancellation revoke never
     /// deletes a freshly re-registered grant.
-    async fn flush_pending_revoke_for_peer(
+    pub(super) async fn flush_pending_revoke_for_peer(
         &self,
         vgen: u64,
         peer: &PublicKey,
@@ -1085,11 +1085,21 @@ impl<V: VaultStore> Engine<V> {
                 let Some(farewell) = inner.state.farewells.first().cloned() else {
                     return Ok(());
                 };
-                let Some(v2_req) = farewell_push_v2_request(&farewell) else {
+                let Some(mut v2_req) = farewell_push_v2_request(&farewell) else {
                     inner.state.farewells.remove(0);
                     inner.save_state().await.map_err(|e| describe(&e))?;
                     continue;
                 };
+                // R15-P2-1: Never transmit a carried classical v1 initial message inside a
+                // farewell (including persisted `fallback_farewells`) once `strict_pq` is active.
+                if inner.client.pq_config().strict_pq
+                    && v2_req
+                        .initial_message
+                        .as_ref()
+                        .is_some_and(|w| w.version < 2)
+                {
+                    v2_req.initial_message = None;
+                }
                 let signs_in_here = same_server(&inner.server, &origin());
                 (inner.server.clone(), signs_in_here, farewell, v2_req)
             };

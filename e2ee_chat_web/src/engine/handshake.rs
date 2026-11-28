@@ -556,9 +556,26 @@ fn preserve_undrained_inbox_prekeys<V: VaultStore>(
 /// `MAX_RETAINED_MANIFEST_DIGESTS - 1` (newest confirmed digests first) so
 /// `prune_manifest_digests_preserving` always evicts the oldest unpinned rolling/unconfirmed digest
 /// instead of falling back to index `0` (the oldest deferred-pinned digest `D_0`).
+#[cfg(test)]
 pub(super) fn preserve_undrained_inbox_prekeys_for_commit<V: VaultStore>(
     inner: &Inner<V>,
     inbox_ready_for_eviction: bool,
+    preserve_spks: &mut Vec<PublicKey>,
+    preserve_digests: &mut Vec<[u8; 32]>,
+) {
+    preserve_undrained_inbox_prekeys_for_commit_with(
+        inner,
+        inbox_ready_for_eviction,
+        None,
+        preserve_spks,
+        preserve_digests,
+    );
+}
+
+pub(super) fn preserve_undrained_inbox_prekeys_for_commit_with<V: VaultStore>(
+    inner: &Inner<V>,
+    inbox_ready_for_eviction: bool,
+    landed: Option<([u8; 32], PublicKey)>,
     preserve_spks: &mut Vec<PublicKey>,
     preserve_digests: &mut Vec<[u8; 32]>,
 ) {
@@ -579,22 +596,37 @@ pub(super) fn preserve_undrained_inbox_prekeys_for_commit<V: VaultStore>(
         }
         return;
     }
-    let candidates = &recent[..recent.len() - 1];
+    // R14-P2-6 + R15-P2-4: Identify the newly staged/landed manifest digest AND its retained SPK
+    // BEFORE commit/reconciliation flips it from unconfirmed to confirmed (using explicit verified
+    // manifest metadata when available, or `digest_retained_spk(recent.last())` which ignores the
+    // `confirmed` flag), so it counts once against its SPK's 16-entry quota and is never double-
+    // counted in `preserve_digests`.
+    let landed_digest = landed
+        .map(|(d, _)| d)
+        .filter(|d| recent.contains(d))
+        .or_else(|| recent.last().copied());
+    let landed_spk = landed
+        .filter(|(_, spk)| inner.client.has_signed_prekey(spk))
+        .map(|(_, spk)| spk)
+        .or_else(|| landed_digest.and_then(|d| inner.client.digest_retained_spk(&d)));
+    let candidates: Vec<[u8; 32]> = recent
+        .iter()
+        .copied()
+        .filter(|d| Some(*d) != landed_digest)
+        .collect();
     let max_candidate_pins = session::MAX_RETAINED_MANIFEST_DIGESTS.saturating_sub(1);
     let mut pinned_candidates = candidates
         .iter()
         .filter(|d| preserve_digests.contains(d))
         .count();
     let mut pinned_confirmed_per_spk: BTreeMap<PublicKey, usize> = BTreeMap::new();
-    // R14-P2-6: Account for the newly committed/landed digest (`recent.last()`) in its retained
-    // SPK's per-SPK quota before pinning older candidates so an SPK with 16 existing digests plus
-    // a newly landed digest cannot retain 17 entries and starve another retained SPK's sole digest.
-    if let Some(last_digest) = recent.last()
-        && let Some(spk) = inner.client.confirmed_digest_retained_spk(last_digest)
-    {
+    if let Some(spk) = landed_spk {
         *pinned_confirmed_per_spk.entry(spk).or_insert(0) += 1;
     }
     for digest in preserve_digests.iter() {
+        if Some(*digest) == landed_digest {
+            continue;
+        }
         if let Some(spk) = inner.client.confirmed_digest_retained_spk(digest) {
             *pinned_confirmed_per_spk.entry(spk).or_insert(0) += 1;
         }
@@ -1880,9 +1912,15 @@ impl<V: VaultStore> Engine<V> {
         let inbox_ready_for_eviction = allow_scheduled_rotation
             && self.inbox_drained_clean.get()
             && inner.state.pending_inbox_acks.is_empty();
-        preserve_undrained_inbox_prekeys_for_commit(
+        let landed_meta = verified_manifest.as_ref().and_then(|m| {
+            let digest = session::protocol::handshake_v2::manifest_digest(m).ok()?;
+            let spk = PublicKey::try_from(m.signed_prekey.as_ref()).ok()?;
+            Some((digest, spk))
+        });
+        preserve_undrained_inbox_prekeys_for_commit_with(
             inner,
             inbox_ready_for_eviction,
+            landed_meta,
             &mut preserve_spks,
             &mut preserve_digests,
         );
@@ -2258,9 +2296,15 @@ impl<V: VaultStore> Engine<V> {
                 let inbox_ready_for_eviction = allow_scheduled_rotation
                     && self.inbox_drained_clean.get()
                     && inner.state.pending_inbox_acks.is_empty();
-                preserve_undrained_inbox_prekeys_for_commit(
+                let landed_meta = prepared.request.manifest.as_ref().and_then(|m| {
+                    let digest = session::protocol::handshake_v2::manifest_digest(m).ok()?;
+                    let spk = PublicKey::try_from(m.signed_prekey.as_ref()).ok()?;
+                    Some((digest, spk))
+                });
+                preserve_undrained_inbox_prekeys_for_commit_with(
                     inner,
                     inbox_ready_for_eviction,
+                    landed_meta,
                     &mut preserve_spks,
                     &mut preserve_digests,
                 );
@@ -3939,7 +3983,7 @@ impl<V: VaultStore> Engine<V> {
                     local_pq_b,
                     active_is_pq,
                     contact.session.peer_pq_state(),
-                    false,
+                    pin_pq,
                     false,
                 );
                 let pruned_classical =
@@ -4023,6 +4067,7 @@ impl<V: VaultStore> Engine<V> {
             }
             if let Err(e) = inner.save(&[]).await {
                 inner.state.pending_revokes = prev_pending_revokes;
+                revoke_staged = false;
                 let _ = inner.roll_back(&peer, snapshot);
                 if !self.is_live(vgen) {
                     return Err(StartChatError::Cancelled);
@@ -4616,61 +4661,94 @@ impl<V: VaultStore> Engine<V> {
                 };
                 if contact.session.active_id() != created_session_id.as_ref() {
                     let mut flush_winning_grant = false;
+                    let mut crossed_winner_blocked_err: Option<StartChatError> = None;
                     let strict_pq_now = inner.client.pq_config().strict_pq;
                     let local_pq_now = inner.local_pq_enabled();
                     if let Some(c) = inner.contact(&peer)
                         && c.state.provisional
                     {
                         c.state.provisional = false;
-                        let can_stage = !c.state.request && !c.state.quarantined;
                         let active_is_pq = c.session.security().is_some_and(|s| s.is_pq);
-                        let allow_earlier_classical = super::allow_earlier_classical_sessions(
-                            strict_pq_now,
-                            local_pq_now,
-                            active_is_pq,
-                            c.session.peer_pq_state(),
-                            pin_pq,
-                            allow_classical,
-                        );
-                        let pruned_classical = if can_stage && !allow_earlier_classical {
-                            c.session.prune_classical_earlier()
-                        } else {
-                            vec![]
-                        };
-                        let revoke_pruned = can_stage
-                            && created_inbound_token_hash
-                                .is_some_and(|h| pruned_classical.contains(&h));
-                        let winning_token = can_stage
-                            .then(|| c.session.active_inbound_token_hash())
-                            .flatten();
-                        let archived_tokens: Vec<[u8; 32]> = if can_stage {
-                            c.session
-                                .earlier_inbound_token_hashes_for_policy(allow_earlier_classical)
-                                .filter(|h| {
-                                    Some(*h) != winning_token
-                                        && (revoke_pruned || Some(*h) != created_inbound_token_hash)
-                                })
-                                .collect()
-                        } else {
-                            vec![]
-                        };
-                        if revoke_pruned {
+                        // R15-P1-3: If a crossed peer classical session won the tie-break while
+                        // Phase 2's `RegisterWriteToken` was in flight and `strict_pq` or local
+                        // PQ policy now blocks classical sessions, do NOT authorize the classical
+                        // winner's write token: convert it to a pending request, revoke Phase 2's
+                        // provisional grant, and return the policy error.
+                        let winner_blocked_by_pq = !active_is_pq
+                            && !c.state.request
+                            && !c.state.quarantined
+                            && super::classical_policy_blocked(
+                                strict_pq_now,
+                                local_pq_now,
+                                c.session.peer_pq_state(),
+                            );
+                        if winner_blocked_by_pq {
+                            c.state.request = true;
+                            c.session.clear_pending_grants();
+                            c.session.prune_classical_earlier();
+                            if strict_pq_now {
+                                c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                            }
                             inner.stage_write_token_revoke(&peer);
                             flush_winning_grant = true;
-                        }
-                        if let Some(token_hash) = winning_token
-                            && inner
-                                .stage_write_token_grant(&peer, token_hash, true)
-                                .is_ok()
-                        {
-                            flush_winning_grant = true;
-                        }
-                        for archived_hash in archived_tokens {
-                            if inner
-                                .stage_write_token_grant(&peer, archived_hash, false)
-                                .is_ok()
+                            crossed_winner_blocked_err = Some(if strict_pq_now {
+                                StartChatError::PqRequired
+                            } else {
+                                StartChatError::ExistingClassicalRequestApprovalRequired
+                            });
+                        } else {
+                            let can_stage = !c.state.request && !c.state.quarantined;
+                            let allow_earlier_classical = super::allow_earlier_classical_sessions(
+                                strict_pq_now,
+                                local_pq_now,
+                                active_is_pq,
+                                c.session.peer_pq_state(),
+                                pin_pq,
+                                allow_classical,
+                            );
+                            let pruned_classical = if can_stage && !allow_earlier_classical {
+                                c.session.prune_classical_earlier()
+                            } else {
+                                vec![]
+                            };
+                            let revoke_pruned = can_stage
+                                && created_inbound_token_hash
+                                    .is_some_and(|h| pruned_classical.contains(&h));
+                            let winning_token = can_stage
+                                .then(|| c.session.active_inbound_token_hash())
+                                .flatten();
+                            let archived_tokens: Vec<[u8; 32]> = if can_stage {
+                                c.session
+                                    .earlier_inbound_token_hashes_for_policy(
+                                        allow_earlier_classical,
+                                    )
+                                    .filter(|h| {
+                                        Some(*h) != winning_token
+                                            && (revoke_pruned
+                                                || Some(*h) != created_inbound_token_hash)
+                                    })
+                                    .collect()
+                            } else {
+                                vec![]
+                            };
+                            if revoke_pruned {
+                                inner.stage_write_token_revoke(&peer);
+                                flush_winning_grant = true;
+                            }
+                            if let Some(token_hash) = winning_token
+                                && inner
+                                    .stage_write_token_grant(&peer, token_hash, true)
+                                    .is_ok()
                             {
                                 flush_winning_grant = true;
+                            }
+                            for archived_hash in archived_tokens {
+                                if inner
+                                    .stage_write_token_grant(&peer, archived_hash, false)
+                                    .is_ok()
+                                {
+                                    flush_winning_grant = true;
+                                }
                             }
                         }
                         if inner.save_state().await.is_err() {
@@ -4705,7 +4783,11 @@ impl<V: VaultStore> Engine<V> {
                     }
                     drop(guard);
                     if flush_winning_grant {
-                        let _ = self.flush_pending_grants_for_peer(&peer).await;
+                        if crossed_winner_blocked_err.is_some() {
+                            let _ = self.flush_pending_revoke_for_peer(vgen, &peer).await;
+                        } else {
+                            let _ = self.flush_pending_grants_for_peer(&peer).await;
+                        }
                         if !self.is_live(vgen) {
                             return Err(StartChatError::Cancelled);
                         }
@@ -4741,7 +4823,10 @@ impl<V: VaultStore> Engine<V> {
                     self.startup.end_new_chat_submit(submission_id);
                     drop(peer_guard);
                     self.wake();
-                    return Ok(peer);
+                    return match crossed_winner_blocked_err {
+                        Some(err) => Err(err),
+                        None => Ok(peer),
+                    };
                 }
                 // Even when our local outbound session won a crossed-start tie-break, any peer
                 // inbound session that arrived while `provisional == true` was archived into

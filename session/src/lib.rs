@@ -317,6 +317,12 @@ impl ClientState {
             })
     }
 
+    fn digest_retained_spk(&self, digest: &[u8; 32]) -> Option<PublicKey> {
+        self.manifest_digest_spks
+            .get(digest)
+            .and_then(|&(spk, _)| self.prekeys.contains_signed_prekey(&spk).then_some(spk))
+    }
+
     fn is_unconfirmed_digest_for_retained_spk(&self, digest: &[u8; 32]) -> bool {
         self.manifest_digest_spks
             .get(digest)
@@ -1171,6 +1177,18 @@ impl<H> Client<H> {
     /// The retained signed prekey bound to confirmed manifest `digest`, if any (`R13-P2-3`).
     pub fn confirmed_digest_retained_spk(&self, digest: &[u8; 32]) -> Option<PublicKey> {
         self.state.confirmed_digest_retained_spk(digest)
+    }
+
+    /// The retained signed prekey bound to `digest` regardless of whether `digest` has been
+    /// confirmed yet (used to count a newly staged/landed manifest digest against its SPK quota
+    /// before commit/reconciliation flips it to confirmed, `R15-P2-4`).
+    pub fn digest_retained_spk(&self, digest: &[u8; 32]) -> Option<PublicKey> {
+        self.state.digest_retained_spk(digest)
+    }
+
+    /// Whether `spk` is currently among this client's retained signed prekeys.
+    pub fn has_signed_prekey(&self, spk: &PublicKey) -> bool {
+        self.state.prekeys.contains_signed_prekey(spk)
     }
 
     /// Whether `digest` is an unconfirmed/ambiguous staged manifest digest bound to a currently

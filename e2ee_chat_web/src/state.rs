@@ -139,8 +139,12 @@ pub enum SecurityAlert {
 pub enum ClassicalPrompt {
     #[default]
     None,
-    /// Outbound initiation or session renewal requires explicit classical approval.
+    /// Outbound initiation or session renewal requires explicit classical approval because the
+    /// peer published a signed manifest disabling PQ.
     Outbound,
+    /// Outbound initiation or session renewal requires explicit classical approval because the
+    /// server/relay currently has PQ disabled (`R15-P2-3`).
+    ServerPqDisabled,
     /// Inbound classical initial message is held in quarantine pending explicit approval.
     InboundQuarantined { peer_was_pq_pinned: bool },
 }

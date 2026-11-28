@@ -119,6 +119,8 @@ pub const ARGON2_SALT_MAX: usize = 64;
 /// Pending outbound classical approval state stored in [`ContactState::classical_approval_needed`].
 pub const CLASSICAL_APPROVAL_NONE: u32 = 0;
 pub const CLASSICAL_APPROVAL_SIGNED_OFF: u32 = 2;
+/// Server/relay reported PQ disabled while attempting outbound initiation/rekey (`R15-P2-3`).
+pub const CLASSICAL_APPROVAL_SERVER_PQ_DISABLED: u32 = 3;
 
 /// Per-contact security alert state stored in [`ContactState::security_alert`].
 pub const SECURITY_ALERT_NONE: u32 = 0;

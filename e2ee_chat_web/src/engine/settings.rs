@@ -9,10 +9,10 @@ use crate::state::{Delivery, ServerPqStatus};
 use crate::transport::Fetch;
 use crate::util::{describe, now, short};
 use crate::vault::{
-    CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF, ContactState,
-    GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, PendingPqRollback,
-    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
-    SECURITY_ALERT_PQ_REQUIRED,
+    CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SERVER_PQ_DISABLED, CLASSICAL_APPROVAL_SIGNED_OFF,
+    ContactState, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry,
+    PendingPqRollback, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED,
+    SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
 };
 use leptos::prelude::*;
 use session::protocol::handshake_v2::LocalHandshakeV2;
@@ -629,7 +629,20 @@ impl<V: VaultStore> Engine<V> {
 
             let snapshot = inner.contacts[index].snapshot();
             let prev_pending_revokes = inner.state.pending_revokes.clone();
-            let old_farewell_mode = inner.contacts[index].farewell_mode();
+            let old_farewell_mode = {
+                let mut m = inner.contacts[index].farewell_mode();
+                if m == FarewellMode::Normal
+                    && inner.contacts[index].is_classical_session()
+                    && super::classical_policy_blocked(
+                        inner.client.pq_config().strict_pq,
+                        inner.local_pq_enabled(),
+                        inner.contacts[index].session.peer_pq_state(),
+                    )
+                {
+                    m = FarewellMode::WithoutInitial;
+                }
+                m
+            };
             let old_had_session = !inner.contacts[index].session.needs_new_session();
             let old_was_unaccepted_request = inner.contacts[index].state.request;
             let old_was_request_or_quarantined =
@@ -1001,6 +1014,12 @@ impl<V: VaultStore> Engine<V> {
         let persist_alert = inner
             .contact(peer)
             .is_some_and(|c| c.session.needs_new_session() || c.state.quarantined);
+        if kind == ErrorKind::ClassicalApprovalRequired && e.is_server_pq_disabled_approval() {
+            inner.set_server_pq(ServerPqStatus::Disabled);
+            if self.is_live(vgen) {
+                self.ui.me.set(Some(inner.me()));
+            }
+        }
         if persist_alert && let Some(contact) = inner.contact(peer) {
             match kind {
                 ErrorKind::DowngradeDetected => {
@@ -1017,6 +1036,7 @@ impl<V: VaultStore> Engine<V> {
                     contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
                 }
                 ErrorKind::ClassicalApprovalRequired => {
+                    let server_disabled = e.is_server_pq_disabled_approval();
                     if matches!(
                         contact.state.security_alert,
                         SECURITY_ALERT_PQ_REQUIRED | SECURITY_ALERT_MANIFEST_EXPIRED
@@ -1024,7 +1044,11 @@ impl<V: VaultStore> Engine<V> {
                         contact.state.security_alert = SECURITY_ALERT_NONE;
                     }
                     if !contact.state.quarantined {
-                        contact.state.classical_approval_needed = CLASSICAL_APPROVAL_SIGNED_OFF;
+                        contact.state.classical_approval_needed = if server_disabled {
+                            CLASSICAL_APPROVAL_SERVER_PQ_DISABLED
+                        } else {
+                            CLASSICAL_APPROVAL_SIGNED_OFF
+                        };
                     }
                 }
                 _ => {}

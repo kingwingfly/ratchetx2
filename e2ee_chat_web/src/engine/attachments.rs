@@ -1443,11 +1443,14 @@ impl<V: VaultStore> Engine<V> {
                 return Err("locked".into());
             }
             let inner = guard.as_mut().ok_or("locked")?;
-            let pending = inner
-                .vault
-                .upload(&peer, &id)
-                .await
-                .map_err(|e| describe(&e))?;
+            // R15-P2-7: Route `Error::Corrupt` into the orphan checkpoint cleanup below (matching
+            // `Engine::unlocked` and `Engine::flush`) while still propagating transient `Storage`
+            // errors.
+            let pending = match inner.vault.upload(&peer, &id).await {
+                Ok(pending) => pending,
+                Err(crate::vault::Error::Corrupt(_)) => None,
+                Err(e) => return Err(describe(&e)),
+            };
             // One that waited for a sign-in never went: its message fails only if that outbox entry
             // still awaits an upload (a stale unstarted record left behind after `start_waiting`
             // promoted the message must only be forgotten, without failing the active message).
@@ -1487,6 +1490,64 @@ impl<V: VaultStore> Engine<V> {
                     .into_iter()
                     .find(|cp| cp.id.as_slice() == id.as_slice());
                 let Some(cp) = orphan_cp else {
+                    // R15-P2-8: If `run_upload` finished `forget_upload` while Cancel was waiting
+                    // for `self.inner`, neither `PendingUpload` nor its checkpoint remains, yet
+                    // the completed file is still downloadable on the server. Locate its outgoing
+                    // pointer in history, fail any still-un-dispatched outbox item, and schedule
+                    // `DeleteCompleted` using its delete key.
+                    let mut completed_delete = None;
+                    let mut should_flush = false;
+                    if let Ok(Some((idx, entry))) =
+                        inner.find_attachment_entry(&peer, None, &id).await
+                        && entry.outgoing
+                    {
+                        if !self.is_live(vgen) {
+                            return Err("locked".into());
+                        }
+                        if let Some(Kind::Attachment(ptr)) =
+                            entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                            && let Ok(key) = <[u8; 32]>::try_from(ptr.key.as_slice())
+                        {
+                            let outbox_state = inner.contact(&peer).and_then(|contact| {
+                                contact
+                                    .state
+                                    .outbox
+                                    .iter()
+                                    .find(|o| o.history_index == idx)
+                                    .map(|o| o.dispatched)
+                            });
+                            match outbox_state {
+                                Some(false) => {
+                                    self.fail_waiting(inner, &peer, idx).await?;
+                                    should_flush = true;
+                                }
+                                Some(true) => {
+                                    should_flush = true;
+                                }
+                                None => {}
+                            }
+                            completed_delete = Some(ServerDeleteJob {
+                                server: inner.server.clone(),
+                                id,
+                                history_index: Some(idx),
+                                name: ptr.name.clone(),
+                                kind: ServerDeleteKind::DeleteCompleted(key.into()),
+                            });
+                        }
+                    }
+                    drop(guard);
+                    drop(peer_guard);
+                    if let Some(job) = completed_delete {
+                        self.finish_server_deletes(&peer, vec![job]).await;
+                    }
+                    if should_flush && self.is_live(vgen) {
+                        if let Err(e) = self.flush(&peer).await
+                            && self.is_live(vgen)
+                        {
+                            self.ui.link.set(Link::Offline(e));
+                        }
+                        self.wake();
+                    }
                     return Ok(());
                 };
                 let mut outbox_match = inner.contact(&peer).and_then(|c| {

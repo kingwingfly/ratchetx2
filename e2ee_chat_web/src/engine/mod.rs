@@ -1567,11 +1567,13 @@ impl Engine<Vault> {
                     if present_uploads.contains(&(cp_peer, cp_id)) {
                         continue;
                     }
-                    // Double-check whether the record actually decodes (e.g. skipped above only
-                    // if already forgotten, which removes the checkpoint too).
-                    if matches!(inner.vault.upload(&cp_peer, &cp_id).await, Ok(Some(_))) {
-                        continue;
-                    }
+                    // R15-P2-5: Only classify `Ok(None)` or `Err(Error::Corrupt(_))` as an
+                    // orphan; skip both valid records (`Ok(Some(_))`) and transient `Storage`
+                    // read errors so temporary IDB glitches never discard a valid upload.
+                    let is_missing_or_corrupt = matches!(
+                        inner.vault.upload(&cp_peer, &cp_id).await,
+                        Ok(None) | Err(crate::vault::Error::Corrupt(_))
+                    );
                     if !self.is_live(vgen) {
                         return false;
                     }
@@ -1580,8 +1582,12 @@ impl Engine<Vault> {
                         self.abort_cancelled_unlock(vgen).await;
                         return false;
                     }
+                    if !is_missing_or_corrupt {
+                        continue;
+                    }
                     orphaned_to_clean.push((cp_peer, cp_id, cp));
                 }
+                let mut orphans_settled = false;
                 for (cp_peer, cp_id, cp) in orphaned_to_clean {
                     if !self.is_live(vgen) {
                         return false;
@@ -1599,7 +1605,7 @@ impl Engine<Vault> {
                                 o.attachment_id.as_slice() == cp_id.as_slice()
                                     || (cp.history_index > 0 && o.history_index == cp.history_index)
                             })
-                            .map(|o| (o.history_index, o.dispatched, o.awaits_upload))
+                            .map(|o| (o.history_index, o.dispatched, o.awaits_upload, o.sealed))
                     });
                     if outbox_match.is_none()
                         && let Ok(Some((idx, entry))) =
@@ -1614,25 +1620,61 @@ impl Engine<Vault> {
                                 .outbox
                                 .iter()
                                 .find(|o| o.history_index == idx)
-                                .map(|o| (o.history_index, o.dispatched, o.awaits_upload))
+                                .map(|o| (o.history_index, o.dispatched, o.awaits_upload, o.sealed))
                         });
                     }
-                    if let Some((idx, dispatched, awaits_upload)) = outbox_match
+                    if let Some((idx, dispatched, awaits_upload, sealed)) = outbox_match
                         && !dispatched
-                        && (awaits_upload
-                            || (cp.uploaded == 0
-                                && matches!(
-                                    cp.upload_state,
-                                    crate::vault::UPLOAD_STATE_STARTED
-                                        | crate::vault::UPLOAD_STATE_ANNOUNCED
-                                )))
                     {
-                        let _ = self.fail_waiting(&mut inner, &cp_peer, idx).await;
-                        if !self.is_live(vgen) {
-                            return false;
+                        // R15-P2-6: Check actual completion via attachment size and `chunks_kept`
+                        // (since `cp.uploaded` is saved before PUTting each chunk). Never fail a
+                        // completed 1-chunk upload; DO fail any un-dispatched incomplete orphan
+                        // (including multi-chunk orphans with `0 < cp.uploaded < total_chunks`
+                        // that can never resume without their `PendingUpload` record).
+                        let is_complete = if !awaits_upload
+                            && matches!(
+                                cp.upload_state,
+                                crate::vault::UPLOAD_STATE_STARTED
+                                    | crate::vault::UPLOAD_STATE_ANNOUNCED
+                            )
+                            && let Some(size) = inner
+                                .attachment_size_for_outbox(&cp_peer, idx, &cp_id, sealed)
+                                .await
+                        {
+                            if !self.is_live(vgen) {
+                                return false;
+                            }
+                            let total_chunks = attachment::chunk_count(size);
+                            let kept = u64::from(
+                                inner.vault.chunks_kept(&cp_peer, &cp_id).await.unwrap_or(0),
+                            );
+                            if !self.is_live(vgen) {
+                                return false;
+                            }
+                            u64::from(cp.uploaded) >= total_chunks || kept >= total_chunks
+                        } else {
+                            false
+                        };
+                        if !is_complete {
+                            // R15-P2-5: Only forget the checkpoint AFTER `fail_waiting` commits so
+                            // a transient IDB failure never strips the zero-chunk guard or strands
+                            // an `awaits_upload` outbox item with no checkpoint.
+                            if self.fail_waiting(&mut inner, &cp_peer, idx).await.is_err() {
+                                if !self.is_live(vgen) {
+                                    return false;
+                                }
+                                continue;
+                            }
+                            if !self.is_live(vgen) {
+                                return false;
+                            }
+                            orphans_settled = true;
                         }
                     }
                     let _ = inner.vault.forget_upload(&cp_peer, &cp_id).await;
+                }
+                if orphans_settled && self.is_live(vgen) {
+                    self.refresh_contacts(&inner);
                 }
             }
             Err(e) if self.is_live(vgen) && !cancelled() => self.ui.notify(describe(&e)),
@@ -2521,12 +2563,26 @@ impl<V: VaultStore> Engine<V> {
         // Not for a request or quarantined chat, which a stranger may have sent: they learn
         // nothing of it. What was read and not told yet goes first, so that the peer sends again
         // only what was not.
+        let strict_pq_del = inner.client.pq_config().strict_pq;
+        let local_pq_del = inner.local_pq_enabled();
         let mut farewell = vec![];
         if let Some(contact) = inner.contact(&peer)
             && !contact.state.request
             && !contact.state.quarantined
         {
-            let mode = contact.farewell_mode();
+            let mut mode = contact.farewell_mode();
+            // R15-P2-1: Never embed a classical v1 carried initial in a deletion farewell once
+            // current local PQ policy blocks classical sessions.
+            if mode == FarewellMode::Normal
+                && contact.is_classical_session()
+                && classical_policy_blocked(
+                    strict_pq_del,
+                    local_pq_del,
+                    contact.session.peer_pq_state(),
+                )
+            {
+                mode = FarewellMode::WithoutInitial;
+            }
             if mode != FarewellMode::Normal {
                 // Restore any durable fallback farewells from a previously established session (e.g.
                 // before an unconfirmed PQ upgrade or recreating a previously deleted chat) so the
@@ -3323,6 +3379,30 @@ impl<V: VaultStore> Inner<V> {
 
     /// Stage a durable `RegisterWriteToken` grant on `peer`'s session using the next monotonic
     /// identity-wide `grant_version`.
+    pub(super) async fn attachment_size_for_outbox(
+        &self,
+        peer: &PublicKey,
+        idx: u64,
+        id: &[u8],
+        sealed: bool,
+    ) -> Option<u64> {
+        if let Ok(Some(entry)) = self.vault.entry(peer, idx).await
+            && let Some(Kind::Attachment(ptr)) =
+                entry.content.as_ref().and_then(|c| c.kind.as_ref())
+            && ptr.id.as_slice() == id
+        {
+            return Some(ptr.size);
+        }
+        if !sealed
+            && let Ok(rec) = self.vault.outgoing(peer, idx).await
+            && let Some(Kind::Attachment(ptr)) = Kind::from_bytes(&rec.content)
+            && ptr.id.as_slice() == id
+        {
+            return Some(ptr.size);
+        }
+        None
+    }
+
     pub(super) fn stage_write_token_revoke(&mut self, peer: &PublicKey) {
         let peer_slot_id = self.client.peer_slot_id(peer);
         if let Ok(min_grant_version) = self.client.allocate_grant_version() {
