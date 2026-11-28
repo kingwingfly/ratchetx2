@@ -2627,6 +2627,27 @@ impl<M> Session<M> {
                 {
                     return Err(ErrorKind::DowngradeDetected.into());
                 }
+            } else if !active.security.is_pq && local_pq_enabled {
+                // R20-P1-3 + R20-P2-1: A locally prepared classical replacement must never bypass
+                // a live downgrade alarm or replace a live PQ pin unless `new` carries a strictly
+                // newer verified signed PQ-OFF manifest superseding a manifested PQ pin with
+                // explicit user approval.
+                let live_hard_pin = state.peer_pq.pq_pinned
+                    && (state.peer_pq.peer_pq_capable || state.peer_pq.pinned_manifest_seq == 0);
+                let superseded_by_newer_approved_off = new.peer_pq.pinned_manifest_seq
+                    > state.peer_pq.pinned_manifest_seq
+                    && !new.peer_pq.peer_pq_capable
+                    && new.peer_pq.allow_classical_exception;
+                let unapproved_manifested_pin = state.peer_pq.pq_pinned
+                    && !state.peer_pq.peer_pq_capable
+                    && !state.peer_pq.allow_classical_exception
+                    && !new.peer_pq.allow_classical_exception;
+                if state.peer_pq.downgrade_detected
+                    || (live_hard_pin && !superseded_by_newer_approved_off)
+                    || unapproved_manifested_pin
+                {
+                    return Err(ErrorKind::DowngradeDetected.into());
+                }
             }
         }
 
@@ -2671,9 +2692,14 @@ impl<M> Session<M> {
                 state.peer_pq.allow_classical_exception = false;
                 state.peer_pq.downgrade_detected = false;
             } else if started_here {
-                state.peer_pq.allow_classical_exception |= new.peer_pq.allow_classical_exception;
-                if state.peer_pq.allow_classical_exception && !state.peer_pq.peer_pq_capable {
-                    state.peer_pq.downgrade_detected = false;
+                // R20-P1-3 + R20-P2-1: Only propagate `allow_classical_exception` when no live
+                // downgrade alarm or active PQ pin applies, and never implicitly clear a live
+                // `downgrade_detected` flag during classical merge.
+                if !state.peer_pq.downgrade_detected
+                    && (!state.peer_pq.pq_pinned || !state.peer_pq.peer_pq_capable)
+                {
+                    state.peer_pq.allow_classical_exception |=
+                        new.peer_pq.allow_classical_exception;
                 }
             }
             if !started_here && active.peer_session_seq > state.peer_pq.peer_session_seq {

@@ -367,6 +367,12 @@ impl Contact {
             downgrade_detected,
             at,
         );
+        if peer_was_pq_pinned {
+            // R20-P1-5: Propagate authenticated PQ capability pins (e.g. from `Hello.pq_capable`
+            // on an inbound quarantined classical initial) onto the live contact session so
+            // subsequent claims and quarantined initials never lose the PQ pin.
+            self.session.pin_peer_pq();
+        }
         if peer_was_pq_pinned || downgrade_detected {
             let peer_pq = self.session.peer_pq_state_mut();
             peer_pq.downgrade_detected = true;

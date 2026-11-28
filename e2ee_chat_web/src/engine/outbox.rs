@@ -573,7 +573,8 @@ impl<V: VaultStore> Engine<V> {
                                                         break;
                                                     }
                                                 };
-                                                if u64::from(pending.uploaded) >= total_chunks
+                                                if self.uploads.is_server_completed(&att_id)
+                                                    || u64::from(pending.uploaded) >= total_chunks
                                                     || kept >= total_chunks
                                                 {
                                                     match inner
@@ -588,6 +589,8 @@ impl<V: VaultStore> Engine<V> {
                                                             // R18-P2-7: Clear any stale paused UI
                                                             // card and cached file handle left by
                                                             // an earlier failed `forget_upload`.
+                                                            self.uploads
+                                                                .clear_server_completed(&att_id);
                                                             self.remove_attachment_caches(
                                                                 peer, &att_id,
                                                             );
@@ -1749,6 +1752,7 @@ impl<V: VaultStore> Engine<V> {
                                 if ready_for_retry {
                                     let retry_is_pq =
                                         retry_req.message.as_ref().is_some_and(|m| m.version >= 2);
+                                    let probe_clock = inner.client.clock().clone();
                                     drop(guard);
                                     let should_send_initial = if greeting_unconfirmed {
                                         true
@@ -1758,19 +1762,43 @@ impl<V: VaultStore> Engine<V> {
                                             .as_ref()
                                             .map(|m| m.signed_prekey.as_ref())
                                             .unwrap_or(&[]);
-                                        let rotated = self
+                                        let probe = self
                                             .probe_confirmed_greeting_spk_rotated(
                                                 &server,
                                                 &audience,
                                                 peer,
                                                 greeting_spk,
                                                 target_generation,
+                                                &probe_clock,
                                             )
                                             .await;
                                         if !self.is_live(vgen) {
                                             return Ok(false);
                                         }
-                                        if rotated != Some(true) {
+                                        // R20-P1-7: Always persist any verified peer manifest pin
+                                        // learned during the SPK-rotation probe BEFORE rechecking
+                                        // classical policy or retiring/reclaiming the session so a
+                                        // newer signed PQ-ON manifest is never discarded.
+                                        let mut guard_check = self.lock_inner().await;
+                                        if !self.is_live(vgen) {
+                                            return Ok(false);
+                                        }
+                                        if let Some(ref probe) = probe
+                                            && let Some(inner) = guard_check.as_mut()
+                                            && !self
+                                                .apply_verified_probe_manifest(
+                                                    vgen,
+                                                    inner,
+                                                    peer,
+                                                    conversation_gen,
+                                                    probe,
+                                                )
+                                                .await
+                                        {
+                                            return Ok(false);
+                                        }
+                                        if !probe.is_some_and(|p| p.rotated) {
+                                            drop(guard_check);
                                             self.queue.record_confirmed_probe_backoff(peer);
                                             false
                                         } else {
@@ -1779,10 +1807,6 @@ impl<V: VaultStore> Engine<V> {
                                             // transmitting `SendInitialV2` so a concurrent delete
                                             // or session swap during `GetManifest` never emits a
                                             // stale greeting.
-                                            let guard_check = self.lock_inner().await;
-                                            if !self.is_live(vgen) {
-                                                return Ok(false);
-                                            }
                                             guard_check.as_ref().is_some_and(|inner| {
                                                 let strict_pq = inner.client.pq_config().strict_pq;
                                                 let local_pq = inner.local_pq_enabled();
@@ -2310,9 +2334,11 @@ impl<V: VaultStore> Engine<V> {
                     ) {
                         contact.state.security_alert = SECURITY_ALERT_NONE;
                     }
-                    // R19-P1-1: Persist verified signed PQ-OFF manifest pin so previously
-                    // PQ-pinned peers transition out of `classical_hard_blocked` and can reach
-                    // explicit `"Allow classical"` approval.
+                    // R19-P1-1 + R20-P1-1 + R20-P1-4: Persist verified signed PQ-OFF manifest pin
+                    // via `commit_signed_pq_off_manifest` (enforcing pre-manifest PQ pins and
+                    // monotonic rollback rejection) so legitimate signed PQ-OFF peers reach
+                    // explicit `"Allow classical"` approval while violations fail closed.
+                    let mut downgraded = false;
                     if !server_disabled
                         && !contact.state.quarantined
                         && !contact.session.peer_pq_state().downgrade_detected
@@ -2320,16 +2346,20 @@ impl<V: VaultStore> Engine<V> {
                         && let Some((seq, digest)) = error.signed_pq_off_manifest()
                     {
                         let ppq = contact.session.peer_pq_state_mut();
-                        if ppq.check_and_pin_manifest(seq, digest).is_ok() {
-                            ppq.peer_pq_capable = false;
+                        if ppq.commit_signed_pq_off_manifest(seq, digest).is_ok() {
                             ppq.clear_classical_exception();
+                        } else {
+                            contact.record_policy_error(ErrorKind::DowngradeDetected);
+                            downgraded = true;
                         }
                     }
-                    contact.state.classical_approval_needed = if server_disabled {
-                        CLASSICAL_APPROVAL_SERVER_PQ_DISABLED
-                    } else {
-                        CLASSICAL_APPROVAL_SIGNED_OFF
-                    };
+                    if !downgraded {
+                        contact.state.classical_approval_needed = if server_disabled {
+                            CLASSICAL_APPROVAL_SERVER_PQ_DISABLED
+                        } else {
+                            CLASSICAL_APPROVAL_SIGNED_OFF
+                        };
+                    }
                 }
                 true
             }
@@ -3482,11 +3512,26 @@ impl<V: VaultStore> Inner<V> {
 
     /// Rebuild ciphertext from the retired session, and messages the peer had not read when
     /// they deleted the chat. Delivery changes from this mailbox page take precedence over disk.
+    #[cfg(test)]
     pub(super) async fn requeue(
         &mut self,
         peer: &PublicKey,
         deleted: bool,
         entries: &BTreeMap<u64, HistoryEntry>,
+    ) -> Result<RequeueOutcome, String> {
+        self.requeue_excluding_gone(peer, deleted, entries, &std::collections::HashSet::new())
+            .await
+    }
+
+    /// Variant of [`Inner::requeue`] that also excludes any server-deleted attachment IDs in
+    /// `pending_gone_ids` whose local `HistoryEntry.gone = true` save failed transiently
+    /// (`R20-P2-8`).
+    pub(super) async fn requeue_excluding_gone(
+        &mut self,
+        peer: &PublicKey,
+        deleted: bool,
+        entries: &BTreeMap<u64, HistoryEntry>,
+        pending_gone_ids: &std::collections::HashSet<[u8; 16]>,
     ) -> Result<RequeueOutcome, String> {
         let contact = self.contact(peer).ok_or("no such chat")?;
         let again = if deleted {
@@ -3502,7 +3547,7 @@ impl<V: VaultStore> Inner<V> {
         };
         let all_sealed = contact.state.needs_requeue_sealed || contact.session.needs_new_session();
         let outcome = self
-            .rebuild_outbox(peer, again, all_sealed, entries)
+            .rebuild_outbox(peer, again, all_sealed, entries, pending_gone_ids)
             .await?;
         if deleted {
             let contact = self.contact(peer).ok_or("no such chat")?;
@@ -3612,8 +3657,14 @@ impl<V: VaultStore> Inner<V> {
         &mut self,
         peer: &PublicKey,
     ) -> Result<RequeueOutcome, String> {
-        self.rebuild_outbox(peer, BTreeSet::new(), true, &BTreeMap::new())
-            .await
+        self.rebuild_outbox(
+            peer,
+            BTreeSet::new(),
+            true,
+            &BTreeMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .await
     }
 
     async fn rebuild_outbox(
@@ -3622,6 +3673,7 @@ impl<V: VaultStore> Inner<V> {
         again: BTreeSet<u64>,
         all_sealed: bool,
         entries: &BTreeMap<u64, HistoryEntry>,
+        pending_gone_ids: &std::collections::HashSet<[u8; 16]>,
     ) -> Result<RequeueOutcome, String> {
         let in_flight = self.in_flight_push.get(peer).copied();
         let contact = self.contact(peer).ok_or("no such chat")?;
@@ -3686,6 +3738,7 @@ impl<V: VaultStore> Inner<V> {
                 content,
                 expected,
                 again.contains(&index),
+                pending_gone_ids,
             );
         }
         // No contact state changes until every fallible history and file read has completed.
@@ -3706,6 +3759,7 @@ pub(super) struct RequeueOutcome {
 }
 
 impl RequeueOutcome {
+    #[allow(clippy::too_many_arguments)]
     fn stage(
         &mut self,
         peer: &PublicKey,
@@ -3714,11 +3768,21 @@ impl RequeueOutcome {
         content: Option<Kind>,
         expected_digest: &[u8],
         resend: bool,
+        pending_gone_ids: &std::collections::HashSet<[u8; 16]>,
     ) {
         let verified = match (entry, content) {
-            // R18-P1-3: Exclude attachments durably marked `gone` (e.g. deleted from server) so
-            // unread requeue after peer deletion never resends a dead attachment pointer.
-            (Some(entry), Some(kind)) if !entry.gone => {
+            // R18-P1-3 + R20-P2-8: Exclude attachments durably marked `gone` OR queued in
+            // `pending_gone` after a transient save failure so unread requeue after peer deletion
+            // never resends a dead attachment pointer.
+            (Some(entry), Some(kind))
+                if !entry.gone
+                    && !matches!(
+                        &kind,
+                        Kind::Attachment(ptr)
+                            if <[u8; 16]>::try_from(ptr.id.as_slice())
+                                .is_ok_and(|id| pending_gone_ids.contains(&id))
+                    ) =>
+            {
                 let bytes = kind.to_bytes();
                 let digest_ok = expected_digest.len() == 32
                     && crate::vault::content_kind_digest(&bytes) == expected_digest;

@@ -58,9 +58,19 @@ pub(super) struct UploadRegistry {
     /// Cancellations requested on this page whose local vault settlement failed transiently
     /// (`R16-P2-9`), retried by `Engine::flush` and `Engine::sync` until committed.
     pending_cancellations: RefCell<HashSet<(PublicKey, [u8; 16])>>,
-    /// Set when `Engine::unlocked`'s initial `vault.uploads(None)` read failed transiently
-    /// (`R16-P2-10`), triggering retry of upload-card restoration and orphan recovery in `sync()`.
-    uploads_restore_needed: Cell<bool>,
+    /// Uploads whose final `PutChunk` succeeded on the server (`R20-P2-4`) so a subsequent local
+    /// chunk-cache or `forget_upload` storage failure never causes `delete_inner` to cancel an
+    /// already-complete attachment for the recipient.
+    server_completed: RefCell<HashSet<[u8; 16]>>,
+    /// Attachments confirmed deleted/missing on the server whose local `HistoryEntry.gone = true`
+    /// save failed transiently (`R20-P2-8`), keyed by `(peer, conversation_gen, id)`. Retried by
+    /// `sync()` and excluded from unread requeue until durably persisted.
+    pending_gone: RefCell<HashSet<(PublicKey, u64, [u8; 16])>>,
+    /// Monotonic request/completion epochs for `restore_uploads_from_vault()` (`R16-P2-10`,
+    /// `R20-P2-7`): incrementing `uploads_restore_epoch` while a restore pass is in flight prevents
+    /// the older pass from overwriting a newer `run_upload` cleanup request with `false`.
+    uploads_restore_epoch: Cell<u64>,
+    uploads_restore_completed: Cell<u64>,
 }
 
 impl UploadRegistry {
@@ -195,12 +205,73 @@ impl UploadRegistry {
             .collect()
     }
 
+    pub(super) fn mark_server_completed(&self, id: [u8; 16]) {
+        self.server_completed.borrow_mut().insert(id);
+    }
+
+    pub(super) fn is_server_completed(&self, id: &[u8; 16]) -> bool {
+        self.server_completed.borrow().contains(id)
+    }
+
+    pub(super) fn clear_server_completed(&self, id: &[u8; 16]) {
+        self.server_completed.borrow_mut().remove(id);
+    }
+
+    pub(super) fn insert_pending_gone(&self, peer: PublicKey, conv_gen: u64, id: [u8; 16]) {
+        self.pending_gone.borrow_mut().insert((peer, conv_gen, id));
+    }
+
+    pub(super) fn remove_pending_gone(&self, peer: &PublicKey, conv_gen: u64, id: &[u8; 16]) {
+        self.pending_gone
+            .borrow_mut()
+            .remove(&(*peer, conv_gen, *id));
+    }
+
+    pub(super) fn remove_peer_pending_gone(&self, peer: &PublicKey) {
+        self.pending_gone.borrow_mut().retain(|(p, _, _)| p != peer);
+    }
+
+    pub(super) fn pending_gone(&self) -> Vec<(PublicKey, u64, [u8; 16])> {
+        self.pending_gone.borrow().iter().copied().collect()
+    }
+
+    pub(super) fn pending_gone_ids_for_peer(
+        &self,
+        peer: &PublicKey,
+        conv_gen: u64,
+    ) -> HashSet<[u8; 16]> {
+        self.pending_gone
+            .borrow()
+            .iter()
+            .filter_map(|(p, g, id)| (p == peer && *g == conv_gen).then_some(*id))
+            .collect()
+    }
+
     pub(super) fn set_restore_needed(&self, needed: bool) {
-        self.uploads_restore_needed.set(needed);
+        if needed {
+            let next = self.uploads_restore_epoch.get().wrapping_add(1);
+            self.uploads_restore_epoch.set(next);
+            if next == self.uploads_restore_completed.get() {
+                self.uploads_restore_epoch.set(next.wrapping_add(1));
+            }
+        } else {
+            self.uploads_restore_completed
+                .set(self.uploads_restore_epoch.get());
+        }
+    }
+
+    pub(super) fn restore_epoch(&self) -> u64 {
+        self.uploads_restore_epoch.get()
+    }
+
+    pub(super) fn finish_restore(&self, started_epoch: u64, incomplete: bool) {
+        if !incomplete && self.uploads_restore_epoch.get() == started_epoch {
+            self.uploads_restore_completed.set(started_epoch);
+        }
     }
 
     pub(super) fn restore_needed(&self) -> bool {
-        self.uploads_restore_needed.get()
+        self.uploads_restore_completed.get() != self.uploads_restore_epoch.get()
     }
 
     pub(super) fn clear_on_teardown(&self) {
@@ -209,7 +280,10 @@ impl UploadRegistry {
         self.cancelled.borrow_mut().clear();
         self.pending_cancel_rollbacks.borrow_mut().clear();
         self.pending_cancellations.borrow_mut().clear();
-        self.uploads_restore_needed.set(false);
+        self.server_completed.borrow_mut().clear();
+        self.pending_gone.borrow_mut().clear();
+        self.uploads_restore_epoch.set(0);
+        self.uploads_restore_completed.set(0);
     }
 
     #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -658,6 +732,10 @@ pub(super) struct StartupFlow {
     publish_waits_settings: Cell<bool>,
     /// Whether a clock-skew warning has already been surfaced during the current drift episode.
     clock_skew_warned: Cell<bool>,
+    /// Verified signed `PQ-OFF` manifest `(seq, digest)` observed during a New Chat attempt for
+    /// `peer` (`R20-P2-2`), retained monotonically across the `"Allow classical"` consent dialog
+    /// so the follow-up `ClaimBundle` rejects rolled-back or equivocating manifests.
+    pending_new_chat_off_pins: RefCell<HashMap<PublicKey, (u64, [u8; 32])>>,
 }
 
 impl StartupFlow {
@@ -934,12 +1012,43 @@ impl StartupFlow {
         }
     }
 
+    /// Record a verified signed `PQ-OFF` manifest `(seq, digest)` observed during New Chat
+    /// (`R20-P2-2`). Rejects rollbacks (`seq < prev`) or equivocation (`seq == prev && digest !=
+    /// prev`) with `Err(())` without mutating stored state.
+    pub(super) fn record_new_chat_signed_pq_off(
+        &self,
+        peer: PublicKey,
+        seq: u64,
+        digest: [u8; 32],
+    ) -> Result<(), ()> {
+        if seq == 0 {
+            return Err(());
+        }
+        let mut pins = self.pending_new_chat_off_pins.borrow_mut();
+        if let Some(&(prev_seq, prev_digest)) = pins.get(&peer)
+            && (seq < prev_seq || (seq == prev_seq && digest != prev_digest))
+        {
+            return Err(());
+        }
+        pins.insert(peer, (seq, digest));
+        Ok(())
+    }
+
+    pub(super) fn new_chat_signed_pq_off(&self, peer: &PublicKey) -> Option<(u64, [u8; 32])> {
+        self.pending_new_chat_off_pins.borrow().get(peer).copied()
+    }
+
+    pub(super) fn clear_new_chat_signed_pq_off(&self, peer: &PublicKey) {
+        self.pending_new_chat_off_pins.borrow_mut().remove(peer);
+    }
+
     pub(super) fn clear_on_teardown(&self) {
         self.unlocking.set(false);
         self.publish_waits_sign_in.set(false);
         self.publish_waits_settings.set(false);
         self.clock_skew_warned.set(false);
         *self.new_chat_feedback.borrow_mut() = None;
+        self.pending_new_chat_off_pins.borrow_mut().clear();
         self.cancel_active_submissions();
     }
 }

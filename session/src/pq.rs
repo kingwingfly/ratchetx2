@@ -147,6 +147,9 @@ impl PeerPqState {
 
     /// Explicitly approve a classical fallback exception for this peer after prompting the user.
     pub fn approve_classical_exception(&mut self) {
+        if self.peer_pq_capable && self.downgrade_detected {
+            return;
+        }
         self.allow_classical_exception = true;
         if !self.peer_pq_capable {
             self.downgrade_detected = false;
@@ -179,6 +182,27 @@ impl PeerPqState {
         }
         self.pinned_manifest_seq = seq;
         self.pinned_manifest_digest = Some(digest);
+        Ok(())
+    }
+
+    /// Verify and commit a signed `PQ-OFF` manifest `(seq, digest)` monotonically onto `self`,
+    /// transitioning `peer_pq_capable = false` when permitted (`R20-P1-4`).
+    ///
+    /// Rejects with [`ErrorKind::DowngradeDetected`] without mutating `self` if:
+    /// - `self` is PQ-capable at `pinned_manifest_seq > 0` and `seq <= pinned_manifest_seq`
+    ///   (rollback or same-sequence replay of an older signed `PQ-OFF` manifest);
+    /// - [`Self::check_and_pin_manifest`] rejects the sequence or digest.
+    ///
+    /// When `pinned_manifest_seq == 0` (e.g. an inbound-initiated PQ contact whose manifest has
+    /// never been observed yet), a valid signed `PQ-OFF` manifest still transitions
+    /// `peer_pq_capable = false` so callers can prompt for explicit user approval (while
+    /// invitation-level `#chat=...&pq=1` links enforce strict refusal at the caller layer).
+    pub fn commit_signed_pq_off_manifest(&mut self, seq: u64, digest: [u8; 32]) -> Result<()> {
+        if self.peer_pq_capable && self.pinned_manifest_seq > 0 && seq <= self.pinned_manifest_seq {
+            return Err(ErrorKind::DowngradeDetected.into());
+        }
+        self.check_and_pin_manifest(seq, digest)?;
+        self.peer_pq_capable = false;
         Ok(())
     }
 }
@@ -1086,14 +1110,19 @@ mod v2 {
 
         let manifest = &claimed.manifest;
         let mut updated_peer_state = peer_state.clone();
-        updated_peer_state
-            .check_and_pin_manifest(manifest.manifest_seq, claimed.manifest_digest)?;
+        if manifest.pq_enabled {
+            updated_peer_state
+                .check_and_pin_manifest(manifest.manifest_seq, claimed.manifest_digest)?;
+        } else {
+            updated_peer_state
+                .commit_signed_pq_off_manifest(manifest.manifest_seq, claimed.manifest_digest)?;
+        }
 
         if claimed.server_pq_disabled_fallback {
             if strict_pq {
                 return Err(ErrorKind::PqRequired.into());
             }
-            if peer_state.pq_pinned {
+            if peer_state.pq_pinned || (local_pq_enabled && peer_state.downgrade_detected) {
                 return Err(ErrorKind::DowngradeDetected.into());
             }
             if local_pq_enabled && !peer_state.allow_classical_exception {
@@ -1140,17 +1169,13 @@ mod v2 {
                 bundle,
             })
         } else {
-            // Peer published a valid signed OFF manifest.
-            if peer_state.peer_pq_capable
-                && peer_state.pinned_manifest_seq > 0
-                && manifest.manifest_seq <= peer_state.pinned_manifest_seq
-            {
-                return Err(ErrorKind::DowngradeDetected.into());
-            }
-            updated_peer_state.peer_pq_capable = false;
-
+            // Peer published a valid signed OFF manifest (already verified against rollback and
+            // pre-manifest PQ pins via `commit_signed_pq_off_manifest` above).
             if strict_pq {
                 return Err(ErrorKind::PqRequired.into());
+            }
+            if local_pq_enabled && peer_state.downgrade_detected {
+                return Err(ErrorKind::DowngradeDetected.into());
             }
             if local_pq_enabled && !peer_state.allow_classical_exception {
                 return Err(match updated_peer_state.pinned_manifest_digest {
@@ -2432,8 +2457,15 @@ mod v2 {
                     .clone();
                 match self.accept_initial_v2(&msg.sender, &peer_state, msg, mailbox.clone()) {
                     Ok(outcome) => {
-                        if let AcceptedInitial::Accepted { ref session, .. } = outcome {
-                            peer_states.insert(msg.sender, session.state.peer_pq.clone());
+                        // R20-P1-2: Propagate updated `PeerPqState` on BOTH `Accepted` and
+                        // `Quarantined` so a later classical initial in the same batch cannot
+                        // ride on a stale pre-batch `allow_classical_exception` after an earlier
+                        // `Hello { pq_capable: true }` quarantine pinned the peer.
+                        match outcome {
+                            AcceptedInitial::Accepted { ref session, .. }
+                            | AcceptedInitial::Quarantined { ref session, .. } => {
+                                peer_states.insert(msg.sender, session.state.peer_pq.clone());
+                            }
                         }
                         ack_ids.push(msg.id);
                         outcomes.push((msg.sender, outcome));
@@ -2764,19 +2796,13 @@ mod v2 {
                 let digest = manifest_digest(manifest)
                     .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
                 let mut candidate = peer_state.clone();
-                candidate.check_and_pin_manifest(manifest.manifest_seq, digest)?;
-                // R19-P2-1: Commit the verified capability transition together with the manifest
-                // sequence and digest so reading a newer valid signed PQ-OFF manifest does not
-                // leave `peer_pq_capable == true` and make the next claim fail `<= pinned_manifest_seq`.
+                // R19-P2-1 + R20-P1-1: Commit the verified capability transition atomically with
+                // the manifest sequence and digest (rejecting pre-manifest PQ pins and rolled-back
+                // PQ-OFF manifests via `commit_signed_pq_off_manifest`).
                 if !manifest.pq_enabled {
-                    if peer_state.peer_pq_capable
-                        && peer_state.pinned_manifest_seq > 0
-                        && manifest.manifest_seq <= peer_state.pinned_manifest_seq
-                    {
-                        return Err(ErrorKind::DowngradeDetected.into());
-                    }
-                    candidate.peer_pq_capable = false;
+                    candidate.commit_signed_pq_off_manifest(manifest.manifest_seq, digest)?;
                 } else {
+                    candidate.check_and_pin_manifest(manifest.manifest_seq, digest)?;
                     candidate.pq_pinned = true;
                     candidate.peer_pq_capable = true;
                     candidate.clear_classical_exception();

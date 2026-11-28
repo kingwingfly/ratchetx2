@@ -530,7 +530,7 @@ impl<V: VaultStore> Engine<V> {
             }
             // Phase 1 under `self.inner`: re-verify preconditions and snapshot claim inputs
             // without mutating live session state.
-            let (server, audience, pq_cfg, clock, peer_pq_for_claim) = {
+            let (server, audience, pq_cfg, clock, snapshot_peer_pq, peer_pq_for_claim) = {
                 let guard = self.lock_inner().await;
                 if !self.is_live(vgen) {
                     return Err("locked".into());
@@ -562,15 +562,19 @@ impl<V: VaultStore> Engine<V> {
                     }
                     return Err("chat session changed while upgrading; please retry.".to_string());
                 }
+                // R20-P1-4: Snapshot unmodified `PeerPqState` to detect concurrent in-band `Hello`
+                // or manifest pinning drift while `ClaimBundle` is suspended outside `self.inner`.
+                let snapshot_peer_pq = contact.session.peer_pq_state().clone();
                 // Clear any prior classical exception on the local clone used for bundle claim so
                 // `claim_peer_bundle_v2` cannot silently negotiate another classical session.
-                let mut peer_pq_for_claim = contact.session.peer_pq_state().clone();
+                let mut peer_pq_for_claim = snapshot_peer_pq.clone();
                 peer_pq_for_claim.clear_classical_exception();
                 (
                     inner.server.clone(),
                     inner.audience.clone(),
                     pq_cfg,
                     inner.client.clock().clone(),
+                    snapshot_peer_pq,
                     peer_pq_for_claim,
                 )
             };
@@ -617,7 +621,9 @@ impl<V: VaultStore> Engine<V> {
                 }
                 return Err("chat session changed while upgrading; please retry.".to_string());
             }
-            if *inner.client.pq_config() != pq_cfg {
+            if *inner.client.pq_config() != pq_cfg
+                || *current.session.peer_pq_state() != snapshot_peer_pq
+            {
                 drop(claim_res);
                 if attempt < MAX_CONFIG_RETRIES {
                     attempt += 1;
@@ -1026,15 +1032,29 @@ impl<V: VaultStore> Engine<V> {
         if kind == ErrorKind::ClockSkew {
             self.warn_clock_skew(inner.client.clock().offset_ms());
         }
-        let persist_alert = inner
-            .contact(peer)
-            .is_some_and(|c| c.session.needs_new_session() || c.state.quarantined);
+        let strict_pq = inner.client.pq_config().strict_pq;
+        let local_pq = inner.local_pq_enabled();
+        let persist_alert = inner.contact(peer).is_some_and(|c| {
+            c.session.needs_new_session()
+                || c.state.quarantined
+                // R20-P2-3: Also persist verified signed PQ-OFF pin and approval prompt (or
+                // security alert) for an unconfirmed classical outgoing chat blocked by local PQ
+                // policy so `"Allow classical"` appears instead of stranding the unsent greeting.
+                || (c.is_classical_session()
+                    && !c.session.is_known_by_peer()
+                    && super::classical_policy_blocked(
+                        strict_pq,
+                        local_pq,
+                        c.session.peer_pq_state(),
+                    ))
+        });
         if kind == ErrorKind::ClassicalApprovalRequired && e.is_server_pq_disabled_approval() {
             inner.set_server_pq(ServerPqStatus::Disabled);
             if self.is_live(vgen) {
                 self.ui.me.set(Some(inner.me()));
             }
         }
+        let mut effective_kind = kind;
         if persist_alert && let Some(contact) = inner.contact(peer) {
             match kind {
                 ErrorKind::DowngradeDetected => {
@@ -1058,10 +1078,12 @@ impl<V: VaultStore> Engine<V> {
                     ) {
                         contact.state.security_alert = SECURITY_ALERT_NONE;
                     }
-                    // R19-P1-1: Persist the peer's verified newer signed PQ-OFF manifest pin so
-                    // previously PQ-pinned peers transition out of `classical_hard_blocked` and
-                    // reach the normal `"Allow classical"` consent flow (still keeping
-                    // `allow_classical_exception = false` until explicit approval).
+                    // R19-P1-1 + R20-P1-1 + R20-P1-4: Persist the peer's verified newer signed
+                    // PQ-OFF manifest pin via `commit_signed_pq_off_manifest` (enforcing both
+                    // pre-manifest PQ pins and monotonic rollback rejection) so legitimate signed
+                    // PQ-OFF peers reach `"Allow classical"`, while rolled-back/pre-manifest pins
+                    // fail closed as `DowngradeDetected`.
+                    let mut downgraded = false;
                     if !server_disabled
                         && !contact.state.quarantined
                         && !contact.session.peer_pq_state().downgrade_detected
@@ -1069,12 +1091,15 @@ impl<V: VaultStore> Engine<V> {
                         && let Some((seq, digest)) = e.signed_pq_off_manifest()
                     {
                         let ppq = contact.session.peer_pq_state_mut();
-                        if ppq.check_and_pin_manifest(seq, digest).is_ok() {
-                            ppq.peer_pq_capable = false;
+                        if ppq.commit_signed_pq_off_manifest(seq, digest).is_ok() {
                             ppq.clear_classical_exception();
+                        } else {
+                            contact.record_policy_error(ErrorKind::DowngradeDetected);
+                            effective_kind = ErrorKind::DowngradeDetected;
+                            downgraded = true;
                         }
                     }
-                    if !contact.state.quarantined {
+                    if !downgraded && !contact.state.quarantined {
                         contact.state.classical_approval_needed = if server_disabled {
                             CLASSICAL_APPROVAL_SERVER_PQ_DISABLED
                         } else {
@@ -1096,7 +1121,7 @@ impl<V: VaultStore> Engine<V> {
         if self.is_live(vgen) {
             self.refresh_contacts(inner);
         }
-        describe_upgrade_pq_error(kind, &inner.server_pq, describe(&e))
+        describe_upgrade_pq_error(effective_kind, &inner.server_pq, describe(&e))
     }
 
     /// Dismiss the active downgrade/security banner for `peer` without removing `pq_pinned`,

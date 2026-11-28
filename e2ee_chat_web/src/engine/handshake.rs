@@ -1175,6 +1175,7 @@ impl<V: VaultStore> Engine<V> {
         let mut pre_final_list_cursor = 0u64;
         let mut after_id = 0u64;
         let mut all_upgrades: BTreeMap<PublicKey, u64> = BTreeMap::new();
+        let mut all_grant_peers: BTreeSet<PublicKey> = BTreeSet::new();
         let mut inbox_peers = BTreeSet::new();
         let mut all_replayed = BTreeSet::new();
         // Serialize inbox `list`/`process`/`ack` pagination without holding `self.inner` across
@@ -1251,7 +1252,7 @@ impl<V: VaultStore> Engine<V> {
             };
             let has_more = inbox.has_more;
             let next_after_id = inbox.next_after_id;
-            let (dirty, grant_peers) = {
+            let dirty = {
                 let mut guard = self.lock_inner().await;
                 if !self.is_live(vgen) {
                     return Ok((false, BTreeSet::new(), false));
@@ -1273,19 +1274,14 @@ impl<V: VaultStore> Engine<V> {
                         return Ok((false, BTreeSet::new(), false));
                     }
                     all_upgrades.extend(upgrades);
+                    all_grant_peers.extend(grant_peers);
                     inbox_peers.extend(touched_peers);
-                    (true, grant_peers)
+                    true
                 } else {
-                    (false, BTreeSet::new())
+                    false
                 }
             };
             if dirty {
-                for peer in grant_peers {
-                    if !self.is_live(vgen) {
-                        return Ok((false, BTreeSet::new(), false));
-                    }
-                    let _ = self.flush_pending_grants_for_peer(&peer).await;
-                }
                 if !self.is_live(vgen) {
                     return Ok((false, BTreeSet::new(), false));
                 }
@@ -1312,9 +1308,16 @@ impl<V: VaultStore> Engine<V> {
                 self.inbox_drained_clean.set(true);
             }
         }
-        // Release `inbox_lock` BEFORE replay, grant flushes, and automatic PQ upgrades so
-        // `inbox_lock` never nests with `peer_flush_lock` (preserving the strict acyclic lock DAG).
+        // Release `inbox_lock` BEFORE grant flushes, replay, and automatic PQ upgrades (`R20-P2-10`)
+        // so `inbox_lock` never nests with `grant_sync_lock` or `peer_flush_lock` and a slow revoke
+        // never stalls publishes or inbox drains.
         drop(inbox_guard);
+        for peer in all_grant_peers {
+            if !self.is_live(vgen) {
+                return Ok((false, BTreeSet::new(), false));
+            }
+            let _ = self.flush_pending_grants_for_peer(&peer).await;
+        }
         // Replay buffered envelopes only AFTER draining inbox pages, scoped strictly to peers
         // whose session state advanced in this pass and bounded to `pre_final_list_cursor` so
         // envelopes concurrently fetched/ACKed after our final `ListInitialMessages` are never
@@ -3402,10 +3405,13 @@ impl<V: VaultStore> Engine<V> {
 
     /// Map a `session::Error` from `claim_peer_bundle_v2` or `finish_prepare_initiate_v2` into
     /// [`StartChatError`], checking `is_live(vgen)` before touching UI signals or cancellation.
+    #[allow(clippy::too_many_arguments)]
     fn map_start_chat_session_error(
         &self,
         vgen: u64,
         submission_id: u64,
+        peer: &PublicKey,
+        pin_pq: bool,
         signs_in_here: bool,
         clock: &session::ServerClock,
         error: session::Error,
@@ -3422,10 +3428,27 @@ impl<V: VaultStore> Engine<V> {
             ErrorKind::SignInRequired => {
                 StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
             }
+            // R20-P1-1: Explicit `#chat=...&pq=1` invitation links promise to refuse classical
+            // downgrades; never offer `"Allow classical"` when a `pin_pq` invite encounters a
+            // `PQ-OFF` or server-disabled classical fallback.
+            ErrorKind::ClassicalApprovalRequired if pin_pq => StartChatError::DowngradeDetected,
             ErrorKind::ClassicalApprovalRequired if error.is_server_pq_disabled_approval() => {
                 StartChatError::ServerPqDisabledApprovalRequired
             }
-            ErrorKind::ClassicalApprovalRequired => StartChatError::ClassicalApprovalRequired,
+            ErrorKind::ClassicalApprovalRequired => {
+                // R20-P2-2: Remember the verified signed PQ-OFF `(seq, digest)` across the
+                // `"Allow classical"` consent dialog so the retry rejects any rollback or
+                // equivocation instead of starting from `pinned_manifest_seq == 0`.
+                if let Some((seq, digest)) = error.signed_pq_off_manifest()
+                    && self
+                        .startup
+                        .record_new_chat_signed_pq_off(*peer, seq, digest)
+                        .is_err()
+                {
+                    return StartChatError::DowngradeDetected;
+                }
+                StartChatError::ClassicalApprovalRequired
+            }
             ErrorKind::DowngradeDetected => StartChatError::DowngradeDetected,
             ErrorKind::PeerManifestExpired => StartChatError::PeerManifestExpired,
             ErrorKind::PqRequired => StartChatError::PqRequired,
@@ -3589,8 +3612,11 @@ impl<V: VaultStore> Engine<V> {
                 if let Some(block_err) = pq_block_err {
                     let mut dirty = false;
                     let was_unrequested_provisional = cur_provisional && !cur_request;
-                    // R13-P2-2: Persist a fresh `pin_pq` invitation pin (clearing any stale
-                    // `allow_classical_exception`) under BOTH `DowngradeDetected` AND `PqRequired`.
+                    // R13-P2-2 + R20-P1-1: Persist a fresh `pin_pq` invitation pin (clearing any
+                    // stale `allow_classical_exception`) under BOTH `DowngradeDetected` AND
+                    // `PqRequired`, and flag `downgrade_detected` whenever `&pq=1` contradicts an
+                    // existing classical session so later disabling `strict_pq` cannot clear it via
+                    // signed PQ-OFF.
                     if pin_pq
                         && matches!(
                             block_err,
@@ -3599,6 +3625,7 @@ impl<V: VaultStore> Engine<V> {
                     {
                         let c = &mut inner.contacts[index];
                         c.session.pin_peer_pq();
+                        c.session.peer_pq_state_mut().downgrade_detected = true;
                         c.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                         if matches!(block_err, StartChatError::DowngradeDetected) {
                             c.record_policy_error(ErrorKind::DowngradeDetected);
@@ -3956,6 +3983,7 @@ impl<V: VaultStore> Engine<V> {
                 {
                     let c = &mut inner.contacts[index];
                     c.session.pin_peer_pq();
+                    c.session.peer_pq_state_mut().downgrade_detected = true;
                     c.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                     if matches!(block_err, StartChatError::DowngradeDetected) {
                         c.record_policy_error(ErrorKind::DowngradeDetected);
@@ -4027,7 +4055,16 @@ impl<V: VaultStore> Engine<V> {
                         contact.record_policy_error(ErrorKind::DowngradeDetected);
                     }
                 }
-                if allow_classical {
+                // R20-P1-6: Never stamp `allow_classical_exception = true` onto a PQ session or a
+                // PQ-pinned / downgrade-blocked contact (e.g. when an inbound PQ initial arrived
+                // while an approved classical New Chat retry was claiming a bundle).
+                if allow_classical
+                    && !pin_pq
+                    && contact.is_classical_session()
+                    && !super::classical_hard_blocked_by_pin_or_downgrade(
+                        contact.session.peer_pq_state(),
+                    )
+                {
                     contact
                         .session
                         .peer_pq_state_mut()
@@ -4370,6 +4407,9 @@ impl<V: VaultStore> Engine<V> {
             {
                 return Err(StartChatError::PqRequired);
             }
+            if pin_pq && allow_classical && inner.local_pq_enabled() {
+                return Err(StartChatError::DowngradeDetected);
+            }
             if inner.contacts.iter().any(|c| c.peer == peer) {
                 return self
                     .finish_existing_contact_start_chat(
@@ -4393,10 +4433,18 @@ impl<V: VaultStore> Engine<V> {
 
         let mut peer_state = PeerPqState::default();
         if pin_pq {
+            // R20-P1-1: A pre-manifest `#chat=...&pq=1` pin refuses classical downgrades; never
+            // attach a classical approval exception alongside `pin_pq`.
             peer_state.pin_peer_pq();
-        }
-        if allow_classical {
-            peer_state.approve_classical_exception();
+        } else {
+            // R20-P2-2: Seed any verified signed PQ-OFF `(seq, digest)` observed before the
+            // `"Allow classical"` consent prompt so rollbacks and equivocations fail closed.
+            if let Some((seq, digest)) = self.startup.new_chat_signed_pq_off(&peer) {
+                let _ = peer_state.check_and_pin_manifest(seq, digest);
+            }
+            if allow_classical {
+                peer_state.approve_classical_exception();
+            }
         }
 
         // Phase 1: Lock-free `ClaimBundle` (retrying cleanly if PQ settings change mid-flight).
@@ -4427,7 +4475,15 @@ impl<V: VaultStore> Engine<V> {
                 )
                 .await
                 .map_err(|e| {
-                    self.map_start_chat_session_error(vgen, submission_id, signs_in_here, &clock, e)
+                    self.map_start_chat_session_error(
+                        vgen,
+                        submission_id,
+                        &peer,
+                        pin_pq,
+                        signs_in_here,
+                        &clock,
+                        e,
+                    )
                 })?;
 
                 if !self.is_live(vgen) {
@@ -4586,7 +4642,15 @@ impl<V: VaultStore> Engine<V> {
                     Fetch::client(&inner.server),
                 )
                 .map_err(|e| {
-                    self.map_start_chat_session_error(vgen, submission_id, signs_in_here, &clock, e)
+                    self.map_start_chat_session_error(
+                        vgen,
+                        submission_id,
+                        &peer,
+                        pin_pq,
+                        signs_in_here,
+                        &clock,
+                        e,
+                    )
                 })?;
 
             let (mut session, outgoing_request) = (prepared.session, prepared.request);
@@ -4687,9 +4751,11 @@ impl<V: VaultStore> Engine<V> {
                 return Err(StartChatError::Cancelled);
             }
 
-            // The chat is now durably persisted; mark `in_flight_start_chat` as greeting-only so a
-            // 403 transport hook clears auto-start ownership immediately instead of handing a stale
-            // reservation to `SignInDialog`.
+            // The chat is now durably persisted; clear any temporary New Chat signed-OFF pin and
+            // mark `in_flight_start_chat` as greeting-only so a 403 transport hook clears
+            // auto-start ownership immediately instead of handing a stale reservation to
+            // `SignInDialog`.
+            self.startup.clear_new_chat_signed_pq_off(&peer);
             self.startup.set_in_flight_start_chat(submission_id, true);
             (
                 created_session_id,
@@ -5484,11 +5550,19 @@ impl<V: VaultStore> Engine<V> {
                     .as_ref()
                     .is_some_and(|m| m.version >= 2);
                 self.check_send_initial_protocol_error(inner, outgoing_is_pq, &e);
-                self.ui.log(format!(
-                    "saved chat with {}, but could not send its initial greeting yet (it will carry on the first message): {}",
-                    short(&peer),
-                    describe(&e)
-                ));
+                if greeting_still_pending {
+                    self.ui.log(format!(
+                        "saved chat with {}, but could not send its initial greeting yet (it will carry on the first message): {}",
+                        short(&peer),
+                        describe(&e)
+                    ));
+                } else {
+                    self.ui.log(format!(
+                        "initial greeting RPC to {} failed after the chat session was already confirmed: {}",
+                        short(&peer),
+                        describe(&e)
+                    ));
+                }
             }
             Ok(()) => {
                 self.startup.end_new_chat_submit(submission_id);

@@ -908,6 +908,22 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return false;
         }
+        // R20-P2-8: Retry any `HistoryEntry.gone = true` saves that failed transiently after
+        // confirmed server deletion so reload + unread requeue never resurrects a deleted pointer.
+        for (gone_peer, gone_conv_gen, gone_id) in self.uploads.pending_gone() {
+            if !self.is_live(vgen) {
+                return false;
+            }
+            if let Err(e) = self
+                .note_gone_by_id_for_gen(&gone_peer, None, &gone_id, Some(gone_conv_gen))
+                .await
+            {
+                failure.get_or_insert(e);
+            }
+        }
+        if !self.is_live(vgen) {
+            return false;
+        }
         self.refresh_server_info(false).await;
         if !self.is_live(vgen) {
             return false;
@@ -1207,12 +1223,22 @@ pub(super) fn uncertain_greeting_reclaim_eligible(state: &ContactState, now_ms: 
         && now_ms.saturating_sub(state.greeting_sent_at) <= GREETING_AUTO_RECLAIM_WINDOW_MS
 }
 
+/// Verified peer manifest summary returned by [`Engine::probe_confirmed_greeting_spk_rotated`]
+/// (`R20-P1-7`) so callers persist the peer's manifest pin monotonically before deciding whether
+/// to probe or reclaim a session.
+pub(super) struct SpkRotationProbe {
+    pub(super) rotated: bool,
+    pub(super) manifest_seq: u64,
+    pub(super) manifest_digest: [u8; 32],
+    pub(super) pq_enabled: bool,
+}
+
 impl<V: VaultStore> Engine<V> {
     /// Non-consuming read-only `GetManifest` probe checking whether `peer`'s current signed
     /// manifest has rotated at least two generations past `target_generation` (evicting both
-    /// `signed_prekey` and `prev_signed_prekey` on the relay). Returns `Some(true)` only when
-    /// verified evicted (`manifest.signed_prekey != greeting_spk && manifest.generation >= target + 2`),
-    /// `Some(false)` if still retained or unknown target generation, or `None` on network/verify error.
+    /// `signed_prekey` and `prev_signed_prekey` on the relay), returning the verified manifest
+    /// metadata (`R20-P1-7`) so callers pin PQ upgrades / detect rollbacks before any subsequent
+    /// reclaim or `ClaimBundle`.
     pub(super) async fn probe_confirmed_greeting_spk_rotated(
         &self,
         server: &str,
@@ -1220,9 +1246,10 @@ impl<V: VaultStore> Engine<V> {
         peer: &PublicKey,
         greeting_spk: &[u8],
         target_generation: u64,
-    ) -> Option<bool> {
+        clock: &session::ServerClock,
+    ) -> Option<SpkRotationProbe> {
         if target_generation == 0 {
-            return Some(false);
+            return None;
         }
         let resp = Fetch::client(server)
             .get_manifest(GetManifestRequest {
@@ -1236,10 +1263,77 @@ impl<V: VaultStore> Engine<V> {
         if verified_id != *peer {
             return None;
         }
-        Some(
-            manifest.signed_prekey.as_ref() != greeting_spk
-                && manifest.generation >= target_generation.saturating_add(2),
+        let manifest_digest = session::protocol::handshake_v2::manifest_digest(&manifest).ok()?;
+        let (local_now, server_now) = clock.trusted_clock_pair().ok()?;
+        session::protocol::handshake_v2::check_manifest_window_bounded(
+            &manifest, local_now, server_now,
         )
+        .ok()?;
+        Some(SpkRotationProbe {
+            rotated: manifest.signed_prekey.as_ref() != greeting_spk
+                && manifest.generation >= target_generation.saturating_add(2),
+            manifest_seq: manifest.manifest_seq,
+            manifest_digest,
+            pq_enabled: manifest.pq_enabled,
+        })
+    }
+
+    /// Commit a verified [`SpkRotationProbe`] manifest monotonically onto `peer`'s `PeerPqState`
+    /// under `Engine::inner` (`R20-P1-7`), persisting immediately so a newer signed PQ-ON manifest
+    /// (or detected rollback/equivocation) is never lost before a `StaleVersion` reclaim.
+    /// Returns `false` if the vault generation tore down during `save_state()`.
+    pub(super) async fn apply_verified_probe_manifest(
+        &self,
+        vgen: u64,
+        inner: &mut Inner<V>,
+        peer: &PublicKey,
+        conversation_gen: u64,
+        probe: &SpkRotationProbe,
+    ) -> bool {
+        let Some(contact) = inner
+            .contacts
+            .iter_mut()
+            .find(|c| c.peer == *peer && c.state.conversation_gen == conversation_gen)
+        else {
+            return self.is_live(vgen);
+        };
+        let before_pq = contact.session.peer_pq_state().clone();
+        let before_alert = contact.state.security_alert;
+        let before_prompt = contact.state.classical_approval_needed;
+        if probe.pq_enabled {
+            let ppq = contact.session.peer_pq_state_mut();
+            if ppq
+                .check_and_pin_manifest(probe.manifest_seq, probe.manifest_digest)
+                .is_ok()
+            {
+                ppq.pq_pinned = true;
+                ppq.peer_pq_capable = true;
+                ppq.clear_classical_exception();
+                contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+            } else {
+                contact.record_policy_error(ErrorKind::DowngradeDetected);
+            }
+        } else if contact
+            .session
+            .peer_pq_state_mut()
+            .commit_signed_pq_off_manifest(probe.manifest_seq, probe.manifest_digest)
+            .is_err()
+        {
+            contact.record_policy_error(ErrorKind::DowngradeDetected);
+        }
+        let changed = *contact.session.peer_pq_state() != before_pq
+            || contact.state.security_alert != before_alert
+            || contact.state.classical_approval_needed != before_prompt;
+        if changed {
+            if inner.save_state().await.is_err() {
+                inner.unsaved_state = true;
+            }
+            if !self.is_live(vgen) {
+                return false;
+            }
+            self.refresh_contacts(inner);
+        }
+        self.is_live(vgen)
     }
 
     /// Lock-free retry of unconfirmed initial greetings (`SendInitialV2`) for outbound chats whose
@@ -1317,6 +1411,7 @@ impl<V: VaultStore> Engine<V> {
                     was_confirmed_probe: bool,
                     target_generation: u64,
                     audience: String,
+                    clock: session::ServerClock,
                 },
             }
             let action = {
@@ -1360,6 +1455,7 @@ impl<V: VaultStore> Engine<V> {
                             was_confirmed_probe: true,
                             target_generation: contact.state.greeting_target_generation,
                             audience: inner.audience.clone(),
+                            clock: inner.client.clock().clone(),
                         }
                     } else {
                         GreetingRetryAction::Skip
@@ -1439,6 +1535,7 @@ impl<V: VaultStore> Engine<V> {
                             was_confirmed_probe: false,
                             target_generation: 0,
                             audience: inner.audience.clone(),
+                            clock: inner.client.clock().clone(),
                         }
                     }
                 } else {
@@ -1455,6 +1552,7 @@ impl<V: VaultStore> Engine<V> {
                 was_confirmed_probe,
                 target_generation,
                 audience,
+                clock,
             ) = match action {
                 GreetingRetryAction::Skip => continue,
                 GreetingRetryAction::ReclaimRetired => {
@@ -1496,6 +1594,7 @@ impl<V: VaultStore> Engine<V> {
                     was_confirmed_probe,
                     target_generation,
                     audience,
+                    clock,
                 } => (
                     server,
                     signs_in_here,
@@ -1506,6 +1605,7 @@ impl<V: VaultStore> Engine<V> {
                     was_confirmed_probe,
                     target_generation,
                     audience,
+                    clock,
                 ),
             };
             if was_confirmed_probe {
@@ -1514,63 +1614,81 @@ impl<V: VaultStore> Engine<V> {
                     .as_ref()
                     .map(|m| m.signed_prekey.as_ref())
                     .unwrap_or(&[]);
-                let rotated = self
+                let probe = self
                     .probe_confirmed_greeting_spk_rotated(
                         &server,
                         &audience,
                         &peer,
                         greeting_spk,
                         target_generation,
+                        &clock,
                     )
                     .await;
                 if !self.is_live(vgen) {
                     return Ok(false);
                 }
-                if rotated != Some(true) {
-                    self.queue.record_confirmed_probe_backoff(&peer);
-                    continue;
-                }
-                // Revalidate contact incarnation, session identity, peer knowledge, and grant
-                // state right before transmitting `SendInitialV2` so deleting/replacing the chat
-                // while `GetManifest` was in flight never emits a stale greeting.
+                // R20-P1-7: Commit any verified manifest learned from the SPK-rotation probe
+                // BEFORE deciding whether to send `SendInitialV2` or reclaim on `StaleVersion`.
                 let still_eligible = {
-                    let guard = self.lock_inner().await;
+                    let mut guard = self.lock_inner().await;
                     if !self.is_live(vgen) {
                         return Ok(false);
                     }
-                    let outgoing_is_pq_check = req.message.as_ref().is_some_and(|m| m.version >= 2);
-                    guard.as_ref().is_some_and(|inner| {
-                        let strict_pq = inner.client.pq_config().strict_pq;
-                        let local_pq = inner.local_pq_enabled();
-                        inner
-                            .contacts
-                            .iter()
-                            .find(|c| c.peer == peer)
-                            .is_some_and(|c| {
-                                !c.state.provisional
-                                    && !c.state.request
-                                    && !c.state.quarantined
-                                    && c.state.conversation_gen == conversation_gen
-                                    && !c.session.needs_new_session()
-                                    && c.session.active_id() == session_id.as_ref()
-                                    && !c.session.is_known_by_peer()
-                                    && !c.session.has_pending_active_grant()
-                                    && (outgoing_is_pq_check
-                                        || !super::classical_policy_blocked(
-                                            strict_pq,
-                                            local_pq,
-                                            c.session.peer_pq_state(),
-                                        ))
-                                    && confirmed_greeting_probe_eligible(&c.state, now())
-                            })
-                    })
+                    if let Some(ref probe) = probe
+                        && let Some(inner) = guard.as_mut()
+                        && !self
+                            .apply_verified_probe_manifest(
+                                vgen,
+                                inner,
+                                &peer,
+                                conversation_gen,
+                                probe,
+                            )
+                            .await
+                    {
+                        return Ok(false);
+                    }
+                    if !probe.is_some_and(|p| p.rotated) {
+                        false
+                    } else {
+                        let outgoing_is_pq_check =
+                            req.message.as_ref().is_some_and(|m| m.version >= 2);
+                        guard.as_ref().is_some_and(|inner| {
+                            let strict_pq = inner.client.pq_config().strict_pq;
+                            let local_pq = inner.local_pq_enabled();
+                            inner
+                                .contacts
+                                .iter()
+                                .find(|c| c.peer == peer)
+                                .is_some_and(|c| {
+                                    !c.state.provisional
+                                        && !c.state.request
+                                        && !c.state.quarantined
+                                        && c.state.conversation_gen == conversation_gen
+                                        && !c.session.needs_new_session()
+                                        && c.session.active_id() == session_id.as_ref()
+                                        && !c.session.is_known_by_peer()
+                                        && !c.session.has_pending_active_grant()
+                                        && (outgoing_is_pq_check
+                                            || !super::classical_policy_blocked(
+                                                strict_pq,
+                                                local_pq,
+                                                c.session.peer_pq_state(),
+                                            ))
+                                        && confirmed_greeting_probe_eligible(&c.state, now())
+                                })
+                        })
+                    }
                 };
                 if !still_eligible {
+                    self.queue.record_confirmed_probe_backoff(&peer);
                     continue;
                 }
             }
             let outgoing_is_pq = req.message.as_ref().is_some_and(|m| m.version >= 2);
-            let send_res: session::Result<()> = Fetch::client(&server)
+            // R20-P2-9: Use `client_without_refused_hook` so a stale background greeting 403 for a
+            // superseded or replaced chat never fires the global sign-in refusal hook.
+            let send_res: session::Result<()> = Fetch::client_without_refused_hook(&server)
                 .send_initial_v2(req)
                 .await
                 .map(|_| ())
@@ -1706,10 +1824,16 @@ impl<V: VaultStore> Engine<V> {
                                 }
                             }
                         }
-                        if e.kind() == ErrorKind::SignInRequired && signs_in_here {
+                        // R20-P2-9: Gate peer sign-in wait + dialog strictly on `matches_session`
+                        // so a late 403 for a superseded/replaced greeting never blocks a healthy
+                        // replacement chat.
+                        if e.kind() == ErrorKind::SignInRequired && signs_in_here && matches_session
+                        {
                             self.queue.mark_waits_sign_in(peer);
                             self.ask_sign_in();
                             self.refresh_contacts(inner);
+                        } else if e.kind() == ErrorKind::SignInRequired && signs_in_here {
+                            // Superseded/deleted session: do not block the replacement chat.
                         } else if was_confirmed_probe {
                             self.check_send_initial_protocol_error(inner, outgoing_is_pq, &e);
                             self.queue.record_confirmed_probe_backoff(&peer);
@@ -2230,7 +2354,17 @@ impl<V: VaultStore> Engine<V> {
                             .retain(|a| !settled_non_attachments.contains(&a.history_index));
                     }
                     if deleted || needs_new_session(inner, peer) {
-                        match inner.requeue(peer, deleted, &changed).await {
+                        let pending_gone_ids = inner
+                            .contact(peer)
+                            .map(|c| {
+                                self.uploads
+                                    .pending_gone_ids_for_peer(peer, c.state.conversation_gen)
+                            })
+                            .unwrap_or_default();
+                        match inner
+                            .requeue_excluding_gone(peer, deleted, &changed, &pending_gone_ids)
+                            .await
+                        {
                             Ok(requeued) => {
                                 all_outbox_updates.extend(requeued.outbox.clone());
                                 changed.extend(requeued.history.iter().cloned());
@@ -2881,7 +3015,17 @@ impl<V: VaultStore> Engine<V> {
                     .retain(|a| !settled_non_attachments.contains(&a.history_index));
             }
             if deleted || needs_new_session(inner, peer) {
-                match inner.requeue(peer, deleted, &changed).await {
+                let pending_gone_ids = inner
+                    .contact(peer)
+                    .map(|c| {
+                        self.uploads
+                            .pending_gone_ids_for_peer(peer, c.state.conversation_gen)
+                    })
+                    .unwrap_or_default();
+                match inner
+                    .requeue_excluding_gone(peer, deleted, &changed, &pending_gone_ids)
+                    .await
+                {
                     Ok(requeued) => {
                         all_outbox_updates.extend(requeued.outbox.clone());
                         changed.extend(requeued.history.iter().cloned());

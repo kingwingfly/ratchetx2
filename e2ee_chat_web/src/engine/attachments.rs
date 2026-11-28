@@ -1791,6 +1791,7 @@ impl<V: VaultStore> Engine<V> {
         // transient IDB error never strands the peer's outbox with no UI card left to retry.
         self.uploads.mark_cancelled(id);
         self.uploads.insert_pending_cancel(peer, id);
+        self.uploads.clear_server_completed(&id);
         self.remove_attachment_caches(&peer, &id);
         self.ui
             .uploads
@@ -2271,6 +2272,7 @@ impl<V: VaultStore> Engine<V> {
                             .is_some_and(|inner| !self.may_keep(inner, &peer, &id))
                 };
                 if gone {
+                    self.uploads.clear_server_completed(&id);
                     self.remove_attachment_caches(&peer, &id);
                     if self.is_live(vgen) {
                         self.ui
@@ -2308,6 +2310,7 @@ impl<V: VaultStore> Engine<V> {
             }
             return Err(err);
         }
+        self.uploads.clear_server_completed(&id);
         self.remove_attachment_caches(&peer, &id);
         if self.is_live(vgen) {
             self.ui
@@ -2567,62 +2570,74 @@ impl<V: VaultStore> Engine<V> {
         expected_gen: Option<u64>,
     ) -> Result<(), String> {
         let vgen = self.vault_gen();
-        let mut guard = self.lock_inner().await;
-        if !self.is_live(vgen) {
-            return Err("locked".into());
-        }
-        let inner = guard.as_mut().ok_or("locked")?;
-        if let Some(expected) = expected_gen
-            && !inner
+        let res = {
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            let inner = guard.as_mut().ok_or("locked")?;
+            let Some(conv_gen) = inner
                 .contacts
                 .iter()
-                .any(|c| c.peer == *peer && c.state.conversation_gen == expected)
-        {
-            return Ok(());
+                .find(|c| c.peer == *peer)
+                .map(|c| c.state.conversation_gen)
+            else {
+                if let Some(expected) = expected_gen {
+                    self.uploads.remove_pending_gone(peer, expected, id);
+                }
+                return Ok(());
+            };
+            if let Some(expected) = expected_gen
+                && conv_gen != expected
+            {
+                self.uploads.remove_pending_gone(peer, expected, id);
+                return Ok(());
+            }
+            let inner_res = self
+                .note_gone_inner(vgen, inner, peer, hint_index, id)
+                .await;
+            (conv_gen, inner_res)
+        };
+        let (conv_gen, inner_res) = res;
+        match inner_res {
+            Ok(()) => {
+                self.uploads.remove_pending_gone(peer, conv_gen, id);
+                Ok(())
+            }
+            Err(e) => {
+                if self.is_live(vgen) {
+                    // R20-P2-8: Queue failed `HistoryEntry.gone = true` saves for retry in `sync()`
+                    // and exclude the deleted pointer from unread requeue until storage recovers.
+                    self.uploads.insert_pending_gone(*peer, conv_gen, *id);
+                    self.wake();
+                }
+                Err(e)
+            }
         }
-        self.note_gone_inner(inner, peer, hint_index, id).await
     }
 
     async fn note_gone_inner(
         &self,
+        vgen: u64,
         inner: &mut Inner<V>,
         peer: &PublicKey,
         hint_index: Option<u64>,
         id: &[u8; 16],
     ) -> Result<(), String> {
-        let mut to_mark: Vec<(u64, crate::vault::HistoryEntry)> = Vec::new();
-        let mut primary_outgoing = false;
-        if let Some((index, entry)) = inner
-            .find_attachment_entry(peer, hint_index, id, None)
+        // R19-P2-3 + R20-P3-2: Locate EVERY history entry carrying attachment `id` (both the
+        // original outgoing message and any reflected incoming echo(es)) so deleting from either
+        // direction marks all matching rows `gone = true` atomically in one save.
+        let to_mark = inner
+            .find_all_attachment_entries(peer, hint_index, id)
             .await
-            .map_err(|e| describe(&e))?
-        {
-            primary_outgoing = entry.outgoing;
-            to_mark.push((index, entry));
-        }
-        // R19-P2-3: If the targeted entry was an incoming echo of an attachment we originally
-        // sent, also mark the earlier outgoing history row `gone = true` atomically so peer-delete
-        // unread requeue never resurrects a deleted attachment pointer into `outbox`.
-        if !primary_outgoing
-            && let Some((out_idx, out_entry)) = inner
-                .find_attachment_entry(peer, None, id, Some(true))
-                .await
-                .map_err(|e| describe(&e))?
-            && !to_mark.iter().any(|(idx, _)| *idx == out_idx)
-        {
-            to_mark.push((out_idx, out_entry));
+            .map_err(|e| describe(&e))?;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
         }
         if to_mark.is_empty() {
             return Ok(());
         }
-        if self.shutting_down.get() || crate::glue::lock_released() {
-            return Err("locked".into());
-        }
-        self.ui.gone.update(|gone| {
-            for (index, _) in &to_mark {
-                gone.insert((*peer, *index));
-            }
-        });
+        let marked_indices: Vec<u64> = to_mark.iter().map(|(index, _)| *index).collect();
         let mut to_save: Vec<(u64, crate::vault::HistoryEntry)> = Vec::new();
         for (index, mut entry) in to_mark {
             if !entry.gone {
@@ -2630,13 +2645,26 @@ impl<V: VaultStore> Engine<V> {
                 to_save.push((index, entry));
             }
         }
-        if to_save.is_empty() {
-            return Ok(());
+        // R20-P2-8: Persist `gone = true` durably BEFORE flipping `self.ui.gone` so a transient
+        // storage error never hides the delete control while leaving `gone = false` on disk.
+        if !to_save.is_empty() {
+            inner
+                .save(&records(peer, &to_save))
+                .await
+                .map_err(|e| describe(&e))?;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
         }
-        inner
-            .save(&records(peer, &to_save))
-            .await
-            .map_err(|e| describe(&e))
+        self.ui.gone.update(|gone| {
+            for index in &marked_indices {
+                gone.insert((*peer, *index));
+            }
+        });
+        if !to_save.is_empty() {
+            self.show_changes(inner, peer, &to_save);
+        }
+        Ok(())
     }
 
     /// Upload the chunks of `pending` from `uploaded` on, encrypting any already-verified resumed
@@ -2723,10 +2751,36 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(true);
             }
-            let _ = self
-                .keep_chunk_for_gen(peer, upload.id(), index, &chunk, None)
-                .await?;
             pending.uploaded = index + 1;
+            let is_final = pending.uploaded >= upload.chunks();
+            if is_final {
+                // R20-P2-4: The server now holds every chunk of this attachment. Record completion
+                // immediately so a subsequent local cache-write or `forget_upload` storage error
+                // never lets `delete_inner` cancel an already-complete attachment for the peer.
+                self.uploads.mark_server_completed(*upload.id());
+            }
+            match self
+                .keep_chunk_for_gen(peer, upload.id(), index, &chunk, None)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) if is_final => {
+                    // Persist `uploaded == chunks` best-effort so completion also survives reload
+                    // if `forget_upload` fails next; local sender caching is strictly optional once
+                    // every chunk is on the server.
+                    let _ = self.save_upload(peer, pending).await;
+                    if self.is_live(vgen) {
+                        self.ui.log(format!(
+                            "uploaded {} to server, but local chunk cache write failed: {e}",
+                            pending.name
+                        ));
+                    }
+                }
+                Err(e) => {
+                    let _ = self.save_upload(peer, pending).await;
+                    return Err(e);
+                }
+            }
         }
         Ok(true)
     }
