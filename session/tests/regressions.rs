@@ -300,19 +300,64 @@ async fn approved_signed_pq_off_inbound_classical_clears_downgrade_detected() {
         .await
         .unwrap();
 
+    // R19-P1-3: A live `downgrade_detected` alarm MUST block inbound classical replacement and
+    // remain preserved in the quarantined session even when a prior signed-PQ-OFF exception was
+    // set, until explicitly cleared by fresh approval.
+    bob_sess.peer_pq_state_mut().pinned_manifest_seq = 2;
     bob_sess.peer_pq_state_mut().downgrade_detected = true;
     let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
-    let incoming = match bob
+    let quarantined = match bob
         .accept_initial_v2(
             &alice.identity_key(),
             bob_sess.peer_pq_state(),
             &listed.messages[0],
+            mb.clone(),
+        )
+        .unwrap()
+    {
+        session::AcceptedInitial::Quarantined { session, .. } => session,
+        session::AcceptedInitial::Accepted { .. } => {
+            panic!("live downgrade_detected must quarantine inbound classical initial");
+        }
+    };
+    assert!(quarantined.peer_pq_state().downgrade_detected);
+    assert_eq!(
+        bob_sess
+            .accept_replacement_with_policy(quarantined, true)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::DowngradeDetected
+    );
+    assert!(bob_sess.peer_pq_state().downgrade_detected);
+
+    // Once the live downgrade alarm is explicitly cleared via fresh approval on the signed-OFF
+    // peer (`pinned_manifest_seq > 0 && !peer_pq_capable`), a subsequent classical rekey succeeds.
+    bob_sess.peer_pq_state_mut().approve_classical_exception();
+    assert!(!bob_sess.peer_pq_state().downgrade_detected);
+    let _ = alice
+        .initiate_v2(
+            AUDIENCE,
+            &bob.identity_key(),
+            &PeerPqState::default(),
+            &common::hello_bytes("alice", 3, false),
+            mb.clone(),
+        )
+        .await
+        .unwrap();
+    let listed2 = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+    let incoming = match bob
+        .accept_initial_v2(
+            &alice.identity_key(),
+            bob_sess.peer_pq_state(),
+            listed2.messages.last().unwrap(),
             mb,
         )
         .unwrap()
     {
-        session::AcceptedInitial::Quarantined { session, .. }
-        | session::AcceptedInitial::Accepted { session, .. } => session,
+        session::AcceptedInitial::Accepted { session, .. } => session,
+        session::AcceptedInitial::Quarantined { .. } => {
+            panic!("clean approved signed PQ-OFF inbound classical must be accepted");
+        }
     };
     assert!(!incoming.peer_pq_state().downgrade_detected);
     assert!(
@@ -977,4 +1022,83 @@ async fn prepare_publish_v2_classical_off_rollback_contract_on_error_and_refusal
     assert_eq!(bob.current_signed_prekey(), Some(spk_gen1));
     assert_eq!(bob.current_one_time_count(), 4);
     assert_eq!(bob.current_pq_one_time_count(suite), 3);
+}
+
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[tokio::test]
+async fn r19_p2_1_get_peer_manifest_for_commits_signed_pq_off_capability_for_next_claim() {
+    let store = SharedStore::default();
+    let hs = V2OnlyHandshake::new(store.clone(), AUDIENCE);
+
+    let mut alice = Client::new(hs.clone());
+    let mut bob = Client::new(hs.clone());
+    alice.publish_v2(AUDIENCE, 4, 4).await.unwrap();
+    bob.publish_v2(AUDIENCE, 4, 4).await.unwrap();
+
+    // Alice pins Bob at PQ-ON seq 1.
+    let mut peer_state = PeerPqState::default();
+    let _ = alice
+        .get_peer_manifest_for(AUDIENCE, &bob.identity_key(), &mut peer_state)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(peer_state.pq_pinned && peer_state.peer_pq_capable);
+    assert_eq!(peer_state.pinned_manifest_seq, 1);
+
+    // Bob legitimately turns PQ OFF and publishes a signed OFF manifest at seq 2.
+    bob.set_pq_config(PqConfig {
+        pq_enabled: false,
+        strict_pq: false,
+        ..PqConfig::default()
+    })
+    .unwrap();
+    bob.publish_v2(AUDIENCE, 4, 0).await.unwrap();
+
+    // Non-consuming read via `get_peer_manifest_for` advances sequence/digest AND clears
+    // `peer_pq_capable`, so claiming that same seq-2 manifest immediately afterward does NOT hit
+    // `DowngradeDetected` (`<= pinned_manifest_seq`).
+    let off_manifest = alice
+        .get_peer_manifest_for(AUDIENCE, &bob.identity_key(), &mut peer_state)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!off_manifest.pq_enabled);
+    assert_eq!(off_manifest.manifest_seq, 2);
+    assert_eq!(peer_state.pinned_manifest_seq, 2);
+    assert!(!peer_state.peer_pq_capable);
+
+    // Before approval: returns `ClassicalApprovalRequired` carrying the verified `(seq, digest)`.
+    let err = session::claim_peer_bundle_v2(
+        &hs,
+        AUDIENCE,
+        &bob.identity_key(),
+        &peer_state,
+        alice.pq_config(),
+        alice.clock(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ClassicalApprovalRequired);
+    assert_eq!(
+        err.signed_pq_off_manifest(),
+        Some((2, peer_state.pinned_manifest_digest.unwrap()))
+    );
+
+    // After explicit approval: claiming the exact same seq-2 manifest succeeds cleanly.
+    peer_state.approve_classical_exception();
+    let claimed = session::claim_peer_bundle_v2(
+        &hs,
+        AUDIENCE,
+        &bob.identity_key(),
+        &peer_state,
+        alice.pq_config(),
+        alice.clock(),
+    )
+    .await
+    .unwrap();
+    let prepared = alice
+        .finish_prepare_initiate_v2(claimed, &peer_state, b"hi", ())
+        .unwrap();
+    assert_eq!(prepared.session.peer_pq_state().pinned_manifest_seq, 2);
+    assert!(!prepared.session.peer_pq_state().peer_pq_capable);
 }

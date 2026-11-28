@@ -93,6 +93,7 @@ impl UploadRegistry {
         self.running.borrow().contains(id)
     }
 
+    #[cfg(test)]
     pub(super) fn snapshot_running(&self) -> HashSet<[u8; 16]> {
         self.running.borrow().clone()
     }

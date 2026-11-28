@@ -368,7 +368,12 @@ impl Contact {
             at,
         );
         if peer_was_pq_pinned || downgrade_detected {
-            self.session.peer_pq_state_mut().downgrade_detected = true;
+            let peer_pq = self.session.peer_pq_state_mut();
+            peer_pq.downgrade_detected = true;
+            // R19-P1-2: Revoke any pre-downgrade classical exception or pending prompt alongside
+            // recording a downgrade-triggered quarantine.
+            peer_pq.clear_classical_exception();
+            self.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
         }
     }
 

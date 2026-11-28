@@ -2296,7 +2296,15 @@ impl<V: VaultStore> Engine<V> {
         if let Err(e) = inner.vault.forget_upload(&peer, &id).await {
             let err = describe(&e);
             if self.is_live(vgen) {
+                // R19-P2-4: Schedule `restore_uploads_from_vault()` in `sync()` so once storage
+                // recovers the completed vault record, cached file, and paused UI card clear
+                // automatically instead of remaining stranded until reload.
+                self.uploads.set_restore_needed(true);
                 self.show_upload(&peer, &pending, UploadState::Paused(err.clone()));
+            }
+            drop(guard);
+            if self.is_live(vgen) {
+                self.wake();
             }
             return Err(err);
         }
@@ -2582,25 +2590,51 @@ impl<V: VaultStore> Engine<V> {
         hint_index: Option<u64>,
         id: &[u8; 16],
     ) -> Result<(), String> {
-        let Some((index, mut entry)) = inner
+        let mut to_mark: Vec<(u64, crate::vault::HistoryEntry)> = Vec::new();
+        let mut primary_outgoing = false;
+        if let Some((index, entry)) = inner
             .find_attachment_entry(peer, hint_index, id, None)
             .await
             .map_err(|e| describe(&e))?
-        else {
+        {
+            primary_outgoing = entry.outgoing;
+            to_mark.push((index, entry));
+        }
+        // R19-P2-3: If the targeted entry was an incoming echo of an attachment we originally
+        // sent, also mark the earlier outgoing history row `gone = true` atomically so peer-delete
+        // unread requeue never resurrects a deleted attachment pointer into `outbox`.
+        if !primary_outgoing
+            && let Some((out_idx, out_entry)) = inner
+                .find_attachment_entry(peer, None, id, Some(true))
+                .await
+                .map_err(|e| describe(&e))?
+            && !to_mark.iter().any(|(idx, _)| *idx == out_idx)
+        {
+            to_mark.push((out_idx, out_entry));
+        }
+        if to_mark.is_empty() {
             return Ok(());
-        };
+        }
         if self.shutting_down.get() || crate::glue::lock_released() {
             return Err("locked".into());
         }
         self.ui.gone.update(|gone| {
-            gone.insert((*peer, index));
+            for (index, _) in &to_mark {
+                gone.insert((*peer, *index));
+            }
         });
-        if entry.gone {
+        let mut to_save: Vec<(u64, crate::vault::HistoryEntry)> = Vec::new();
+        for (index, mut entry) in to_mark {
+            if !entry.gone {
+                entry.gone = true;
+                to_save.push((index, entry));
+            }
+        }
+        if to_save.is_empty() {
             return Ok(());
         }
-        entry.gone = true;
         inner
-            .save(&records(peer, &[(index, entry)]))
+            .save(&records(peer, &to_save))
             .await
             .map_err(|e| describe(&e))
     }

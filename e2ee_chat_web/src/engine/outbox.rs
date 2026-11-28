@@ -543,19 +543,21 @@ impl<V: VaultStore> Engine<V> {
                                 }
                                 let need_zero_guard =
                                     is_zero_chunk && !self.uploads.has_file(peer, &att_id);
-                                let need_upload_check = need_zero_guard
-                                    || (!is_zero_chunk && !self.uploads.is_running(&att_id));
+                                let need_upload_check =
+                                    need_zero_guard || !self.uploads.is_running(&att_id);
                                 if need_upload_check {
                                     match inner.vault.upload(peer, &att_id).await {
                                         _ if !self.is_live(vgen) => return Ok(false),
                                         Ok(Some(pending)) => {
-                                            // R17-P2-3: Even when `PendingUpload` is still intact
-                                            // on disk (e.g. unlock cleanup hit a transient
-                                            // `chunks_kept` or `forget_upload` error on a
-                                            // completed 1-chunk upload), detect completion via
-                                            // `chunks_kept`, forget the stale upload, and unblock
-                                            // the peer's outbox cleanly.
-                                            if need_zero_guard && pending.started() {
+                                            // R17-P2-3 + R19-P2-4: For any started non-running
+                                            // `PendingUpload` (1-chunk or multi-chunk, even if the
+                                            // local file handle is still cached after a failed
+                                            // `forget_upload`), detect durable completion via
+                                            // `chunks_kept`, forget the stale upload, and clear
+                                            // its paused card/cache.
+                                            if pending.started()
+                                                && !self.uploads.is_running(&att_id)
+                                            {
                                                 let total_chunks =
                                                     session::attachment::chunk_count(pending.size);
                                                 let kept = match inner
@@ -2308,6 +2310,21 @@ impl<V: VaultStore> Engine<V> {
                     ) {
                         contact.state.security_alert = SECURITY_ALERT_NONE;
                     }
+                    // R19-P1-1: Persist verified signed PQ-OFF manifest pin so previously
+                    // PQ-pinned peers transition out of `classical_hard_blocked` and can reach
+                    // explicit `"Allow classical"` approval.
+                    if !server_disabled
+                        && !contact.state.quarantined
+                        && !contact.session.peer_pq_state().downgrade_detected
+                        && contact.state.security_alert != SECURITY_ALERT_DOWNGRADE
+                        && let Some((seq, digest)) = error.signed_pq_off_manifest()
+                    {
+                        let ppq = contact.session.peer_pq_state_mut();
+                        if ppq.check_and_pin_manifest(seq, digest).is_ok() {
+                            ppq.peer_pq_capable = false;
+                            ppq.clear_classical_exception();
+                        }
+                    }
                     contact.state.classical_approval_needed = if server_disabled {
                         CLASSICAL_APPROVAL_SERVER_PQ_DISABLED
                     } else {
@@ -2318,8 +2335,9 @@ impl<V: VaultStore> Engine<V> {
             }
             ErrorKind::DowngradeDetected => {
                 if let Some(contact) = inner.contact(peer) {
-                    contact.session.peer_pq_state_mut().downgrade_detected = true;
-                    contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                    // R19-P1-2: Route through `record_policy_error` so pre-downgrade classical
+                    // exceptions and stale prompts are cleared atomically with the downgrade flag.
+                    contact.record_policy_error(ErrorKind::DowngradeDetected);
                 }
                 true
             }

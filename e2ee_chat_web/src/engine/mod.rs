@@ -2837,17 +2837,9 @@ impl<V: VaultStore> Engine<V> {
             }
         }
         // Read before anything changes, as the vault forgets them with the chat: cancel any
-        // started upload that is still shown, running, or unannounced (leaving already-finished
-        // uploads whose vault cleanup raced deletion intact), and mark every vaulted upload ID
-        // cancelled so racing tasks cannot resurrect ghost entries.
-        let shown: HashSet<Vec<u8>> = self.ui.uploads.with_untracked(|uploads| {
-            uploads
-                .iter()
-                .filter(|upload| upload.peer == peer)
-                .map(|upload| upload.id.to_vec())
-                .collect()
-        });
-        let running = self.uploads.snapshot_running();
+        // unannounced, explicitly cancelled, or durably incomplete started upload (leaving
+        // already-finished announced uploads intact for the recipient), and mark every vaulted
+        // upload ID cancelled so racing tasks cannot resurrect ghost entries (`R19-P1-5`).
         // R17-P2-4: Include any announced uploads whose `cancel_upload` failed transiently (so
         // they were removed from `shown` and stopped, yet still need server-side cancellation
         // before chat deletion erases the upload token and clears `pending_cancellations`).
@@ -2889,15 +2881,12 @@ impl<V: VaultStore> Engine<V> {
                 continue;
             }
             let id_arr = <[u8; 16]>::try_from(pending.id.as_slice()).ok();
-            let id_running = id_arr.is_some_and(|id| running.contains(&id));
             let id_pending_cancel = id_arr.is_some_and(|id| pending_cancels.contains(&id));
-            let known_unfinished = shown.contains(&pending.id)
-                || id_running
-                || id_pending_cancel
-                || !pending.is_announced();
-            // R18-P2-5: When unlock deferred upload restoration (`!shown`), use persisted chunk
-            // progress to distinguish hidden incomplete announced uploads from completed ones.
-            let persisted_incomplete = if known_unfinished {
+            // R18-P2-5 + R19-P1-5: Cancel on the server ONLY when unannounced, explicitly
+            // pending-cancelled, OR durable chunk progress shows the announced upload is genuinely
+            // incomplete — never let a stale paused UI card (`shown`) or finishing task
+            // (`id_running`) delete an already-completed attachment for the recipient.
+            let should_cancel = if !pending.is_announced() || id_pending_cancel {
                 true
             } else {
                 let chunks = attachment::chunk_count(pending.size);
@@ -2907,20 +2896,21 @@ impl<V: VaultStore> Engine<V> {
                     match inner.vault.chunks_kept(&peer, &pending.id).await {
                         _ if !self.is_live(vgen) => return Err("locked".into()),
                         Ok(kept) => u64::from(kept) < chunks,
-                        Err(_) => true,
+                        Err(e) => return Err(describe(&e)),
                     }
                 }
             };
-            if persisted_incomplete
+            if should_cancel
                 && id_arr.is_none_or(|id| unfinished_ids.insert(id))
                 && let Ok(upload) = upload_of(&pending)
             {
                 unfinished.push((pending.name.clone(), upload));
             }
         }
-        // R18-P2-5: Resolve surviving outgoing delete keys for any `pending_cancellations` whose
-        // `PendingUpload` was already forgotten or is corrupt (and therefore omitted from
-        // `vault.uploads()`), before `forget_peer` erases history and outbox records.
+        // R18-P2-5 + R19-P2-2: Resolve surviving outgoing delete keys for any
+        // `pending_cancellations` whose `PendingUpload` was already forgotten or is corrupt (and
+        // therefore omitted from `vault.uploads()`), before `forget_peer` erases history and
+        // outbox records; propagate transient storage errors when no key could be recovered.
         let mut completed_deletes: Vec<(String, [u8; 16], zeroize::Zeroizing<[u8; 32]>)> =
             Vec::new();
         for cancel_id in &pending_cancels {
@@ -2951,6 +2941,7 @@ impl<V: VaultStore> Engine<V> {
                 .map(|cp| cp.history_index)
                 .or_else(|| outbox_match.map(|(idx, _)| idx));
             let mut found_key: Option<(String, [u8; 32])> = None;
+            let mut lookup_err: Option<String> = None;
             match inner
                 .find_attachment_entry(&peer, hint_idx, cancel_id, Some(true))
                 .await
@@ -2965,24 +2956,34 @@ impl<V: VaultStore> Engine<V> {
                         found_key = Some((ptr.name.clone(), key));
                     }
                 }
-                Ok(None) | Err(_) => {}
+                Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {}
+                Err(e) => lookup_err = Some(describe(&e)),
             }
             if found_key.is_none()
                 && let Some((idx, false)) = outbox_match
-                && let Ok(rec) = inner.vault.outgoing(&peer, idx).await
             {
-                if !self.is_live(vgen) {
-                    return Err("locked".into());
-                }
-                if let Some(Kind::Attachment(ptr)) = Kind::from_bytes(&rec.content)
-                    && ptr.id.as_slice() == cancel_id.as_slice()
-                    && let Ok(key) = <[u8; 32]>::try_from(ptr.key.as_slice())
-                {
-                    found_key = Some((ptr.name.clone(), key));
+                match inner.vault.outgoing(&peer, idx).await {
+                    _ if !self.is_live(vgen) => return Err("locked".into()),
+                    Ok(rec) => {
+                        if let Some(Kind::Attachment(ptr)) = Kind::from_bytes(&rec.content)
+                            && ptr.id.as_slice() == cancel_id.as_slice()
+                            && let Ok(key) = <[u8; 32]>::try_from(ptr.key.as_slice())
+                        {
+                            found_key = Some((ptr.name.clone(), key));
+                        }
+                    }
+                    Err(crate::vault::Error::Corrupt(_)) => {}
+                    Err(e) => {
+                        if lookup_err.is_none() {
+                            lookup_err = Some(describe(&e));
+                        }
+                    }
                 }
             }
             if let Some((name, key)) = found_key {
                 completed_deletes.push((name, *cancel_id, key.into()));
+            } else if let Some(err) = lookup_err {
+                return Err(err);
             }
         }
         // The peer is told, on the session as it is now, so that its next message starts a new

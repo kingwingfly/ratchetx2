@@ -1153,7 +1153,15 @@ mod v2 {
                 return Err(ErrorKind::PqRequired.into());
             }
             if local_pq_enabled && !peer_state.allow_classical_exception {
-                return Err(ErrorKind::ClassicalApprovalRequired.into());
+                return Err(match updated_peer_state.pinned_manifest_digest {
+                    Some(digest) if updated_peer_state.pinned_manifest_seq > 0 => {
+                        Error::signed_pq_off_approval(
+                            updated_peer_state.pinned_manifest_seq,
+                            digest,
+                        )
+                    }
+                    _ => ErrorKind::ClassicalApprovalRequired.into(),
+                });
             }
             let bundle = classical_bundle_from_claim(&claimed.response)?;
             Ok(ResolvedBundlePolicy::Classical {
@@ -2326,25 +2334,24 @@ mod v2 {
                     self.state.prekeys.confirm(x3dh)?;
 
                     let security = SessionSecurity::classical();
+                    let hello_claims_pq = hello.as_ref().is_some_and(|h| h.pq_capable);
                     let active_pq_pin = peer_state.pq_pinned
                         && (peer_state.peer_pq_capable || peer_state.pinned_manifest_seq == 0);
-                    let signed_pq_off_approved = peer_state.pq_pinned
-                        && !peer_state.peer_pq_capable
-                        && peer_state.allow_classical_exception;
                     let quarantined = local_pq_enabled
                         && (active_pq_pin
                             || peer_state.downgrade_detected
+                            || hello_claims_pq
                             || !peer_state.allow_classical_exception);
 
                     let mut updated_peer_pq = peer_state.clone();
                     if quarantined {
+                        if hello_claims_pq {
+                            updated_peer_pq.pq_pinned = true;
+                            updated_peer_pq.peer_pq_capable = true;
+                            updated_peer_pq.clear_classical_exception();
+                        }
                         updated_peer_pq.downgrade_detected =
-                            hello.as_ref().is_some_and(|h| h.pq_capable)
-                                || (peer_state.downgrade_detected && !signed_pq_off_approved)
-                                || (peer_state.pq_pinned
-                                    && (peer_state.peer_pq_capable
-                                        || (peer_state.pinned_manifest_seq == 0
-                                            && !peer_state.allow_classical_exception)));
+                            hello_claims_pq || peer_state.downgrade_detected || active_pq_pin;
                     } else if let Some(ref h) = hello {
                         let _ =
                             check_peer_hello(&mut updated_peer_pq, security, h, local_pq_enabled);
@@ -2369,7 +2376,7 @@ mod v2 {
                         Ok(AcceptedInitial::Quarantined {
                             session,
                             first_message: content,
-                            peer_was_pq_pinned: active_pq_pin && !signed_pq_off_approved,
+                            peer_was_pq_pinned: active_pq_pin || hello_claims_pq,
                         })
                     } else {
                         Ok(AcceptedInitial::Accepted {
@@ -2758,6 +2765,22 @@ mod v2 {
                     .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
                 let mut candidate = peer_state.clone();
                 candidate.check_and_pin_manifest(manifest.manifest_seq, digest)?;
+                // R19-P2-1: Commit the verified capability transition together with the manifest
+                // sequence and digest so reading a newer valid signed PQ-OFF manifest does not
+                // leave `peer_pq_capable == true` and make the next claim fail `<= pinned_manifest_seq`.
+                if !manifest.pq_enabled {
+                    if peer_state.peer_pq_capable
+                        && peer_state.pinned_manifest_seq > 0
+                        && manifest.manifest_seq <= peer_state.pinned_manifest_seq
+                    {
+                        return Err(ErrorKind::DowngradeDetected.into());
+                    }
+                    candidate.peer_pq_capable = false;
+                } else {
+                    candidate.pq_pinned = true;
+                    candidate.peer_pq_capable = true;
+                    candidate.clear_classical_exception();
+                }
                 let (local_now, server_now) = self.clock.trusted_clock_pair()?;
                 check_manifest_window_bounded(manifest, local_now, server_now)
                     .map_err(|e| Error::new(ErrorKind::PeerManifestExpired, e))?;

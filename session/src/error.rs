@@ -13,6 +13,7 @@ pub struct Error {
     server_refusal: bool,
     connect_error: bool,
     server_pq_disabled_approval: bool,
+    signed_pq_off_manifest: Option<(u64, [u8; 32])>,
 }
 
 impl Error {
@@ -33,10 +34,28 @@ impl Error {
         }
     }
 
+    /// Construct [`ErrorKind::ClassicalApprovalRequired`] carrying the peer's verified newer
+    /// signed PQ-OFF manifest `(manifest_seq, manifest_digest)` so callers can persist the
+    /// verified capability downgrade transition before requesting explicit user consent
+    /// (`R19-P1-1`).
+    pub(crate) fn signed_pq_off_approval(manifest_seq: u64, manifest_digest: [u8; 32]) -> Self {
+        Self {
+            signed_pq_off_manifest: Some((manifest_seq, manifest_digest)),
+            ..ErrorKind::ClassicalApprovalRequired.into()
+        }
+    }
+
     /// Whether this [`ErrorKind::ClassicalApprovalRequired`] error resulted from the server
     /// reporting PQ disabled (as opposed to the peer's signed manifest disabling PQ).
     pub fn is_server_pq_disabled_approval(&self) -> bool {
         self.server_pq_disabled_approval
+    }
+
+    /// The verified signed PQ-OFF manifest `(manifest_seq, manifest_digest)` carried by a
+    /// [`ErrorKind::ClassicalApprovalRequired`] error, if the peer published a valid signed OFF
+    /// manifest (`R19-P1-1`).
+    pub fn signed_pq_off_manifest(&self) -> Option<(u64, [u8; 32])> {
+        self.signed_pq_off_manifest
     }
 
     /// The kind of this error.
@@ -93,6 +112,7 @@ impl From<ErrorKind> for Error {
             server_refusal: false,
             connect_error: false,
             server_pq_disabled_approval: false,
+            signed_pq_off_manifest: None,
         }
     }
 }

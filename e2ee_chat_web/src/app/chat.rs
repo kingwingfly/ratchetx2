@@ -259,10 +259,10 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                         } else {
                                             "Classical chat request quarantined: this peer initiated without post-quantum encryption. "
                                         }}
-                                        {if strict_pq {
-                                            "Require post-quantum (strict mode) blocks classical exceptions. Upgrade to PQ or disable strict mode in Settings."
-                                        } else if hard_blocked {
+                                        {if hard_blocked {
                                             "Its incoming message is held until you upgrade to post-quantum encryption."
+                                        } else if strict_pq {
+                                            "Require post-quantum (strict mode) blocks classical exceptions. Upgrade to PQ or disable strict mode in Settings."
                                         } else if downgrade {
                                             "Its incoming message is held until you explicitly allow classical encryption or upgrade to PQ."
                                         } else {
@@ -316,7 +316,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                 <div class="banner warn" role="alert">
                                     <span>
                                         {lead}
-                                        {if strict_pq {
+                                        {if hard_blocked {
+                                            "This peer is post-quantum pinned or a downgrade was detected, which blocks classical fallback. Retry PQ when available."
+                                        } else if strict_pq {
                                             "Require post-quantum (strict mode) blocks classical fallback. Retry PQ when available or disable strict mode in Settings."
                                         } else {
                                             "Allow classical fallback to send?"

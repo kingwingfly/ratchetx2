@@ -1038,9 +1038,9 @@ impl<V: VaultStore> Engine<V> {
         if persist_alert && let Some(contact) = inner.contact(peer) {
             match kind {
                 ErrorKind::DowngradeDetected => {
-                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                    contact.session.peer_pq_state_mut().downgrade_detected = true;
-                    contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                    // R19-P1-2: Route through `record_policy_error` so pre-downgrade classical
+                    // exceptions and stale prompts are cleared atomically with the downgrade flag.
+                    contact.record_policy_error(ErrorKind::DowngradeDetected);
                 }
                 ErrorKind::PeerManifestExpired => {
                     contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
@@ -1057,6 +1057,22 @@ impl<V: VaultStore> Engine<V> {
                         SECURITY_ALERT_PQ_REQUIRED | SECURITY_ALERT_MANIFEST_EXPIRED
                     ) {
                         contact.state.security_alert = SECURITY_ALERT_NONE;
+                    }
+                    // R19-P1-1: Persist the peer's verified newer signed PQ-OFF manifest pin so
+                    // previously PQ-pinned peers transition out of `classical_hard_blocked` and
+                    // reach the normal `"Allow classical"` consent flow (still keeping
+                    // `allow_classical_exception = false` until explicit approval).
+                    if !server_disabled
+                        && !contact.state.quarantined
+                        && !contact.session.peer_pq_state().downgrade_detected
+                        && contact.state.security_alert != SECURITY_ALERT_DOWNGRADE
+                        && let Some((seq, digest)) = e.signed_pq_off_manifest()
+                    {
+                        let ppq = contact.session.peer_pq_state_mut();
+                        if ppq.check_and_pin_manifest(seq, digest).is_ok() {
+                            ppq.peer_pq_capable = false;
+                            ppq.clear_classical_exception();
+                        }
                     }
                     if !contact.state.quarantined {
                         contact.state.classical_approval_needed = if server_disabled {

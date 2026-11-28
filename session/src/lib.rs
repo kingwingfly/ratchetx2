@@ -2616,13 +2616,11 @@ impl<M> Session<M> {
                     return Err(ErrorKind::StaleSession.into());
                 }
                 // Defense-in-depth: never let a classical peer-initiated session silently
-                // overwrite an actively PQ-pinned or downgrade-flagged peer.
-                let signed_pq_off_approved = state.peer_pq.pq_pinned
-                    && !state.peer_pq.peer_pq_capable
-                    && state.peer_pq.allow_classical_exception;
+                // overwrite an actively PQ-pinned peer or bypass a live downgrade alarm
+                // (`R19-P1-3`).
                 if !active.security.is_pq
                     && local_pq_enabled
-                    && ((state.peer_pq.downgrade_detected && !signed_pq_off_approved)
+                    && (state.peer_pq.downgrade_detected
                         || (state.peer_pq.pq_pinned
                             && (state.peer_pq.peer_pq_capable
                                 || !state.peer_pq.allow_classical_exception)))
@@ -2677,11 +2675,6 @@ impl<M> Session<M> {
                 if state.peer_pq.allow_classical_exception && !state.peer_pq.peer_pq_capable {
                     state.peer_pq.downgrade_detected = false;
                 }
-            } else if state.peer_pq.allow_classical_exception
-                && !state.peer_pq.peer_pq_capable
-                && !new.peer_pq.downgrade_detected
-            {
-                state.peer_pq.downgrade_detected = false;
             }
             if !started_here && active.peer_session_seq > state.peer_pq.peer_session_seq {
                 state.peer_pq.peer_session_seq = active.peer_session_seq;

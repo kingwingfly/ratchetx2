@@ -1579,19 +1579,23 @@ impl<V: VaultStore> Engine<V> {
                 let server = inner.server.clone();
                 let contact = &mut inner.contacts[index];
                 let is_pq = session.security().is_some_and(|security| security.is_pq);
-                // R18-P1-1: Never allow an inbound classical session to replace or auto-register
-                // write tokens on a peer with an active PQ pin or active downgrade alarm even if
-                // an earlier classical exception was set prior to the downgrade.
+                // R18-P1-1 + R19-P1-4: Never allow an inbound classical session to replace or
+                // auto-register write tokens on a peer with an active PQ pin, active downgrade
+                // alarm, or an authenticated `Hello` claiming `pq_capable == true`.
                 let hard_blocked_downgrade = !is_pq
                     && local_pq
-                    && (super::classical_hard_blocked_by_pin_or_downgrade(
-                        contact.session.peer_pq_state(),
-                    ) || contact.state.security_alert == SECURITY_ALERT_DOWNGRADE);
+                    && (incoming_hello_downgrade
+                        || session.peer_pq_state().downgrade_detected
+                        || super::classical_hard_blocked_by_pin_or_downgrade(
+                            contact.session.peer_pq_state(),
+                        )
+                        || contact.state.security_alert == SECURITY_ALERT_DOWNGRADE);
                 let effective_quarantine = quarantine.or_else(|| {
                     hard_blocked_downgrade.then_some(
-                        contact.session.peer_pq_state().pq_pinned
-                            && (contact.session.peer_pq_state().peer_pq_capable
-                                || contact.session.peer_pq_state().pinned_manifest_seq == 0),
+                        incoming_hello_downgrade
+                            || (contact.session.peer_pq_state().pq_pinned
+                                && (contact.session.peer_pq_state().peer_pq_capable
+                                    || contact.session.peer_pq_state().pinned_manifest_seq == 0)),
                     )
                 });
                 if let Some(pinned) = effective_quarantine {
@@ -3595,9 +3599,9 @@ impl<V: VaultStore> Engine<V> {
                     {
                         let c = &mut inner.contacts[index];
                         c.session.pin_peer_pq();
+                        c.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                         if matches!(block_err, StartChatError::DowngradeDetected) {
-                            c.session.peer_pq_state_mut().downgrade_detected = true;
-                            c.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                            c.record_policy_error(ErrorKind::DowngradeDetected);
                         }
                         dirty = true;
                     }
@@ -3615,8 +3619,7 @@ impl<V: VaultStore> Engine<V> {
                                 c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
                             }
                             StartChatError::DowngradeDetected => {
-                                c.session.peer_pq_state_mut().downgrade_detected = true;
-                                c.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                                c.record_policy_error(ErrorKind::DowngradeDetected);
                             }
                             _ => {}
                         }
@@ -3953,9 +3956,9 @@ impl<V: VaultStore> Engine<V> {
                 {
                     let c = &mut inner.contacts[index];
                     c.session.pin_peer_pq();
+                    c.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                     if matches!(block_err, StartChatError::DowngradeDetected) {
-                        c.session.peer_pq_state_mut().downgrade_detected = true;
-                        c.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                        c.record_policy_error(ErrorKind::DowngradeDetected);
                     }
                     dirty = true;
                 }
@@ -3970,8 +3973,7 @@ impl<V: VaultStore> Engine<V> {
                             c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
                         }
                         StartChatError::DowngradeDetected => {
-                            c.session.peer_pq_state_mut().downgrade_detected = true;
-                            c.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                            c.record_policy_error(ErrorKind::DowngradeDetected);
                         }
                         _ => {}
                     }
@@ -4019,10 +4021,10 @@ impl<V: VaultStore> Engine<V> {
                 let contact = &mut inner.contacts[index];
                 if pin_pq {
                     contact.session.pin_peer_pq();
+                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                     if contact.state.quarantined {
                         contact.state.quarantined_was_pq_pinned = true;
-                        contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
-                        contact.session.peer_pq_state_mut().downgrade_detected = true;
+                        contact.record_policy_error(ErrorKind::DowngradeDetected);
                     }
                 }
                 if allow_classical {
@@ -4782,14 +4784,14 @@ impl<V: VaultStore> Engine<V> {
                             if strict_pq_now {
                                 if pin_pq {
                                     c.session.pin_peer_pq();
+                                    c.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                                 }
                                 c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
                             } else if is_downgrade {
                                 if pin_pq {
                                     c.session.pin_peer_pq();
                                 }
-                                c.session.peer_pq_state_mut().downgrade_detected = true;
-                                c.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                                c.record_policy_error(ErrorKind::DowngradeDetected);
                             }
                             inner.stage_write_token_revoke(&peer);
                             flush_winning_grant = true;
@@ -5385,6 +5387,15 @@ impl<V: VaultStore> Engine<V> {
                 c.state.conversation_gen == created_conv_gen
                     && c.session.active_id() == created_session_id.as_ref()
             });
+        // R19-P2-5: Only present `Dialog::SignIn` on a same-origin 403 when this exact session's
+        // greeting is still pending (not superseded or already confirmed by a crossed inbound
+        // session while `SendInitialV2` was in flight).
+        let greeting_still_pending = matches_session
+            && inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .is_some_and(|c| c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED);
 
         match send_res {
             Err(e) => {
@@ -5396,6 +5407,7 @@ impl<V: VaultStore> Engine<V> {
                 // cannot claim this submission's history reservation while IndexedDB persists.
                 if e.kind() == ErrorKind::SignInRequired
                     && signs_in_here
+                    && greeting_still_pending
                     && !self.is_submission_cancelled(submission_id)
                 {
                     let dialog = self
